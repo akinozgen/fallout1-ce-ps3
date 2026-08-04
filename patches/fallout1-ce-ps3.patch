@@ -1,0 +1,2023 @@
+diff -ruN u/CMakeLists.txt cur/CMakeLists.txt
+--- u/CMakeLists.txt	2026-08-04 19:34:52.346157252 +0000
++++ cur/CMakeLists.txt	2026-08-04 19:34:58.233527748 +0000
+@@ -279,6 +279,14 @@
+     )
+ endif()
+ 
++if(PS3)
++    target_sources(${EXECUTABLE_NAME} PUBLIC
++        "src/platform/ps3/osk.cc"
++        "src/platform/ps3/osk.h"
++        "src/platform/ps3/paths.h"
++    )
++endif()
++
+ if(WIN32)
+     target_compile_definitions(${EXECUTABLE_NAME} PUBLIC
+         _CRT_SECURE_NO_WARNINGS
+@@ -345,7 +353,18 @@
+     set(MACOSX_BUNDLE_BUNDLE_VERSION "1.0.0")
+ endif()
+ 
+-if((NOT ${CMAKE_SYSTEM_NAME} MATCHES "Linux") AND (NOT ${CMAKE_SYSTEM_NAME} MATCHES "FreeBSD") AND (NOT ${CMAKE_SYSTEM_NAME} MATCHES "OpenBSD"))
++if(PS3)
++    # SDL2_PSL1GHT is installed in the toolchain; sdl2-config provides the link
++    # flags (including PS3-specific libraries such as -lgcm_sys -lrsx -lsysutil).
++    set(PS3_SDL2_CONFIG "$ENV{PS3DEV}/portlibs/ppu/bin/sdl2-config")
++    execute_process(COMMAND ${PS3_SDL2_CONFIG} --cflags
++        OUTPUT_VARIABLE PS3_SDL2_CFLAGS OUTPUT_STRIP_TRAILING_WHITESPACE)
++    execute_process(COMMAND ${PS3_SDL2_CONFIG} --libs
++        OUTPUT_VARIABLE PS3_SDL2_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE)
++    string(REGEX MATCH "-I([^ ]+)" _sdl2_inc "${PS3_SDL2_CFLAGS}")
++    set(SDL2_INCLUDE_DIRS "${CMAKE_MATCH_1}")
++    separate_arguments(SDL2_LIBRARIES UNIX_COMMAND "${PS3_SDL2_LIBS}")
++elseif((NOT ${CMAKE_SYSTEM_NAME} MATCHES "Linux") AND (NOT ${CMAKE_SYSTEM_NAME} MATCHES "FreeBSD") AND (NOT ${CMAKE_SYSTEM_NAME} MATCHES "OpenBSD"))
+     add_subdirectory("third_party/sdl2")
+ else()
+     find_package(SDL2)
+diff -ruN u/cmake/toolchain/ps3.cmake cur/cmake/toolchain/ps3.cmake
+--- u/cmake/toolchain/ps3.cmake	1970-01-01 00:00:00.000000000 +0000
++++ cur/cmake/toolchain/ps3.cmake	2026-08-04 19:34:53.580672542 +0000
+@@ -0,0 +1,39 @@
++# CMake toolchain file - PlayStation 3 (PSL1GHT / ps3dev)
++#
++# Usage (inside the ps3dev Docker image):
++#   cmake -B build-ps3 -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain/ps3.cmake
++#   cmake --build build-ps3 -j
++
++set(CMAKE_SYSTEM_NAME Generic)
++set(CMAKE_SYSTEM_PROCESSOR powerpc64)
++
++set(PS3DEV "$ENV{PS3DEV}")
++if(NOT PS3DEV)
++    set(PS3DEV "/usr/local/ps3dev")
++endif()
++set(PSL1GHT "$ENV{PSL1GHT}")
++if(NOT PSL1GHT)
++    set(PSL1GHT "${PS3DEV}")
++endif()
++
++set(CMAKE_C_COMPILER   "${PS3DEV}/ppu/bin/powerpc64-ps3-elf-gcc")
++set(CMAKE_CXX_COMPILER "${PS3DEV}/ppu/bin/powerpc64-ps3-elf-g++")
++set(CMAKE_ASM_COMPILER "${PS3DEV}/ppu/bin/powerpc64-ps3-elf-gcc")
++
++set(CMAKE_FIND_ROOT_PATH "${PS3DEV}/ppu" "${PS3DEV}/portlibs/ppu" "${PSL1GHT}/ppu")
++set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
++set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
++set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
++set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
++
++# Link tests do not work without the lv2 runtime; make try_compile build a static lib.
++set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
++
++set(PS3_COMMON_FLAGS "-mcpu=cell -mhard-float -fmodulo-sched -ffunction-sections -fdata-sections -D__PS3__ -D__PSL1GHT__ -isystem ${PSL1GHT}/ppu/include")
++
++set(CMAKE_C_FLAGS_INIT   "${PS3_COMMON_FLAGS}")
++set(CMAKE_CXX_FLAGS_INIT "${PS3_COMMON_FLAGS} -D_GLIBCXX11_USE_C99_STDIO")
++set(CMAKE_EXE_LINKER_FLAGS_INIT "-L${PSL1GHT}/ppu/lib -Wl,--gc-sections")
++
++# For the platform branches inside CMakeLists
++set(PS3 TRUE)
+diff -ruN u/src/audio_engine.cc cur/src/audio_engine.cc
+--- u/src/audio_engine.cc	2026-08-04 19:34:52.361492846 +0000
++++ cur/src/audio_engine.cc	2026-08-04 19:34:53.500160675 +0000
+@@ -10,6 +10,38 @@
+ 
+ #define AUDIO_ENGINE_SOUND_BUFFERS 8
+ 
++#ifdef __PS3__
++// No pthreads on PS3/newlib, and libstdc++ is built without thread support ->
++// std::recursive_mutex is undefined. SDL_mutex is already recursive; this is a
++// thin wrapper exposing the same BasicLockable interface (lock/unlock).
++class AudioMutex {
++public:
++    AudioMutex()
++        : mutex_(SDL_CreateMutex())
++    {
++    }
++    ~AudioMutex()
++    {
++        SDL_DestroyMutex(mutex_);
++    }
++    AudioMutex(const AudioMutex&) = delete;
++    AudioMutex& operator=(const AudioMutex&) = delete;
++    void lock()
++    {
++        SDL_LockMutex(mutex_);
++    }
++    void unlock()
++    {
++        SDL_UnlockMutex(mutex_);
++    }
++
++private:
++    SDL_mutex* mutex_;
++};
++#else
++using AudioMutex = std::recursive_mutex;
++#endif
++
+ struct AudioEngineSoundBuffer {
+     bool active;
+     unsigned int size;
+@@ -22,7 +54,7 @@
+     bool looping;
+     unsigned int pos;
+     SDL_AudioStream* stream;
+-    std::recursive_mutex mutex;
++    AudioMutex mutex;
+ };
+ 
+ extern bool GNW95_isActive;
+@@ -54,7 +86,7 @@
+ 
+     for (int index = 0; index < AUDIO_ENGINE_SOUND_BUFFERS; index++) {
+         AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[index]);
+-        std::lock_guard<std::recursive_mutex> lock(soundBuffer->mutex);
++        std::lock_guard<AudioMutex> lock(soundBuffer->mutex);
+ 
+         if (soundBuffer->active && soundBuffer->playing) {
+             int srcFrameSize = soundBuffer->bitsPerSample / 8 * soundBuffer->channels;
+@@ -96,21 +128,39 @@
+ bool audioEngineInit()
+ {
+     if (SDL_InitSubSystem(SDL_INIT_AUDIO) == -1) {
++#ifdef __PS3__
++        printf("[fce] SDL audio subsystem FAILED: %s\n", SDL_GetError());
++#endif
+         return false;
+     }
+ 
+     SDL_AudioSpec desiredSpec;
+     desiredSpec.freq = 22050;
++#ifdef __PS3__
++    // Samples come out of the ACM decoder in host byte order (BE); since
++    // AUDIO_S16 means little-endian, it would mis-convert on a BE host.
++    desiredSpec.format = AUDIO_S16SYS;
++#else
+     desiredSpec.format = AUDIO_S16;
++#endif
+     desiredSpec.channels = 2;
+     desiredSpec.samples = 1024;
+     desiredSpec.callback = audioEngineMixin;
+ 
+     gAudioEngineDeviceId = SDL_OpenAudioDevice(NULL, 0, &desiredSpec, &gAudioEngineSpec, SDL_AUDIO_ALLOW_ANY_CHANGE);
+     if (gAudioEngineDeviceId == -1) {
++#ifdef __PS3__
++        printf("[fce] SDL_OpenAudioDevice FAILED: %s\n", SDL_GetError());
++#endif
+         return false;
+     }
+ 
++#ifdef __PS3__
++    printf("[fce] audio opened: dev=%d freq=%d format=0x%x ch=%d samples=%d\n",
++        (int)gAudioEngineDeviceId, gAudioEngineSpec.freq, gAudioEngineSpec.format,
++        gAudioEngineSpec.channels, gAudioEngineSpec.samples);
++#endif
++
+     SDL_PauseAudioDevice(gAudioEngineDeviceId, 0);
+ 
+     return true;
+@@ -150,7 +200,7 @@
+ 
+     for (int index = 0; index < AUDIO_ENGINE_SOUND_BUFFERS; index++) {
+         AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[index]);
+-        std::lock_guard<std::recursive_mutex> lock(soundBuffer->mutex);
++        std::lock_guard<AudioMutex> lock(soundBuffer->mutex);
+ 
+         if (!soundBuffer->active) {
+             soundBuffer->active = true;
+@@ -163,7 +213,12 @@
+             soundBuffer->looping = false;
+             soundBuffer->pos = 0;
+             soundBuffer->data = malloc(size);
++#ifdef __PS3__
++            // see audioEngineInit - the source format is in host byte order.
++            soundBuffer->stream = SDL_NewAudioStream(bitsPerSample == 16 ? AUDIO_S16SYS : AUDIO_S8, channels, rate, gAudioEngineSpec.format, gAudioEngineSpec.channels, gAudioEngineSpec.freq);
++#else
+             soundBuffer->stream = SDL_NewAudioStream(bitsPerSample == 16 ? AUDIO_S16 : AUDIO_S8, channels, rate, gAudioEngineSpec.format, gAudioEngineSpec.channels, gAudioEngineSpec.freq);
++#endif
+             return index;
+         }
+     }
+@@ -182,7 +237,7 @@
+     }
+ 
+     AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[soundBufferIndex]);
+-    std::lock_guard<std::recursive_mutex> lock(soundBuffer->mutex);
++    std::lock_guard<AudioMutex> lock(soundBuffer->mutex);
+ 
+     if (!soundBuffer->active) {
+         return false;
+@@ -210,7 +265,7 @@
+     }
+ 
+     AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[soundBufferIndex]);
+-    std::lock_guard<std::recursive_mutex> lock(soundBuffer->mutex);
++    std::lock_guard<AudioMutex> lock(soundBuffer->mutex);
+ 
+     if (!soundBuffer->active) {
+         return false;
+@@ -232,7 +287,7 @@
+     }
+ 
+     AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[soundBufferIndex]);
+-    std::lock_guard<std::recursive_mutex> lock(soundBuffer->mutex);
++    std::lock_guard<AudioMutex> lock(soundBuffer->mutex);
+ 
+     if (!soundBuffer->active) {
+         return false;
+@@ -254,7 +309,7 @@
+     }
+ 
+     AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[soundBufferIndex]);
+-    std::lock_guard<std::recursive_mutex> lock(soundBuffer->mutex);
++    std::lock_guard<AudioMutex> lock(soundBuffer->mutex);
+ 
+     if (!soundBuffer->active) {
+         return false;
+@@ -277,7 +332,7 @@
+     }
+ 
+     AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[soundBufferIndex]);
+-    std::lock_guard<std::recursive_mutex> lock(soundBuffer->mutex);
++    std::lock_guard<AudioMutex> lock(soundBuffer->mutex);
+ 
+     if (!soundBuffer->active) {
+         return false;
+@@ -303,7 +358,7 @@
+     }
+ 
+     AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[soundBufferIndex]);
+-    std::lock_guard<std::recursive_mutex> lock(soundBuffer->mutex);
++    std::lock_guard<AudioMutex> lock(soundBuffer->mutex);
+ 
+     if (!soundBuffer->active) {
+         return false;
+@@ -325,7 +380,7 @@
+     }
+ 
+     AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[soundBufferIndex]);
+-    std::lock_guard<std::recursive_mutex> lock(soundBuffer->mutex);
++    std::lock_guard<AudioMutex> lock(soundBuffer->mutex);
+ 
+     if (!soundBuffer->active) {
+         return false;
+@@ -360,7 +415,7 @@
+     }
+ 
+     AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[soundBufferIndex]);
+-    std::lock_guard<std::recursive_mutex> lock(soundBuffer->mutex);
++    std::lock_guard<AudioMutex> lock(soundBuffer->mutex);
+ 
+     if (!soundBuffer->active) {
+         return false;
+@@ -382,7 +437,7 @@
+     }
+ 
+     AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[soundBufferIndex]);
+-    std::lock_guard<std::recursive_mutex> lock(soundBuffer->mutex);
++    std::lock_guard<AudioMutex> lock(soundBuffer->mutex);
+ 
+     if (!soundBuffer->active) {
+         return false;
+@@ -443,7 +498,7 @@
+     }
+ 
+     AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[soundBufferIndex]);
+-    std::lock_guard<std::recursive_mutex> lock(soundBuffer->mutex);
++    std::lock_guard<AudioMutex> lock(soundBuffer->mutex);
+ 
+     if (!soundBuffer->active) {
+         return false;
+@@ -465,7 +520,7 @@
+     }
+ 
+     AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[soundBufferIndex]);
+-    std::lock_guard<std::recursive_mutex> lock(soundBuffer->mutex);
++    std::lock_guard<AudioMutex> lock(soundBuffer->mutex);
+ 
+     if (!soundBuffer->active) {
+         return false;
+diff -ruN u/src/game/editor.cc cur/src/game/editor.cc
+--- u/src/game/editor.cc	2026-08-04 19:34:52.365326745 +0000
++++ cur/src/game/editor.cc	2026-08-04 19:34:53.036258967 +0000
+@@ -5,6 +5,13 @@
+ #include <stdio.h>
+ #include <string.h>
+ 
++#ifdef __PS3__
++#include <SDL.h>
++
++#include "platform/ps3/osk.h"
++#include "plib/gnw/kb.h"
++#endif
++
+ #include "game/art.h"
+ #include "game/bmpdlog.h"
+ #include "game/critter.h"
+@@ -1458,6 +1465,62 @@
+         maxLength = 255;
+     }
+ 
++#ifdef __PS3__
++    // When the text field becomes active the PS3 system keyboard opens
++    // automatically, prefilled with the current content; on accept the field is
++    // replaced entirely. On cancel we fall through to the classic loop. (The
++    // same hook exists in win_input_str - the engine has two separate text
++    // input functions.)
++    {
++        char oldCopy[257];
++        strcpy(oldCopy, text);
++        int oldLength = (int)strlen(oldCopy);
++        oldCopy[oldLength] = ' ';
++        oldCopy[oldLength + 1] = '\0';
++        int oldWidth = text_width(oldCopy);
++
++        char oskText[256];
++        bool accepted = ps3_osk_get_text("", text, oskText, maxLength);
++
++        // Keep pad events accumulated while navigating the OSK out of the game.
++        SDL_FlushEvents(SDL_JOYAXISMOTION, SDL_JOYDEVICEREMOVED);
++        kb_clear();
++
++        if (accepted) {
++            if ((flags & 0x01) != 0) {
++                // isdoschar filter: strip invalid characters.
++                char* dst = oskText;
++                char* src = oskText;
++                while (*src != '\0') {
++                    if (isdoschar((unsigned char)*src)) {
++                        *dst++ = *src;
++                    }
++                    src++;
++                }
++                *dst = '\0';
++            }
++
++            strncpy(text, oskText, maxLength);
++            text[maxLength] = '\0';
++
++            char newCopy[257];
++            strcpy(newCopy, text);
++            int newLength = (int)strlen(newCopy);
++            newCopy[newLength] = ' ';
++            newCopy[newLength + 1] = '\0';
++            int newWidth = text_width(newCopy);
++
++            int clearWidth = oldWidth > newWidth ? oldWidth : newWidth;
++            buf_fill(windowBuffer + windowWidth * y + x, clearWidth, v60, windowWidth, backgroundColor);
++            text_to_buf(windowBuffer + windowWidth * y + x, newCopy, windowWidth, windowWidth, textColor);
++            win_draw(win);
++            renderPresent();
++
++            return 0;
++        }
++    }
++#endif
++
+     char copy[257];
+     strcpy(copy, text);
+ 
+diff -ruN u/src/game/fontmgr.cc cur/src/game/fontmgr.cc
+--- u/src/game/fontmgr.cc	2026-08-04 19:34:52.365326745 +0000
++++ cur/src/game/fontmgr.cc	2026-08-04 19:34:53.028591171 +0000
+@@ -402,6 +402,8 @@
+ // 0x442520
+ static void swapUInt32(unsigned int* value)
+ {
++#ifndef __PS3__
++    // See swapUInt16 - no-op on PS3.
+     unsigned int swapped = *value;
+     unsigned short high = swapped >> 16;
+     // NOTE: Uninline.
+@@ -410,14 +412,19 @@
+     // NOTE: Uninline.
+     swapUInt16(&low);
+     *value = (low << 16) | high;
++#endif
+ }
+ 
+ // 0x442568
+ static void swapUInt16(unsigned short* value)
+ {
++#ifndef __PS3__
++    // .aaf files are big-endian, so a little-endian host needs the swap.
++    // On big-endian PS3 the data is already in host order - do NOT swap.
+     unsigned short swapped = *value;
+     swapped = (swapped >> 8) | (swapped << 8);
+     *value = swapped;
++#endif
+ }
+ 
+ static void swapInt32(int* value)
+diff -ruN u/src/game/game.cc cur/src/game/game.cc
+--- u/src/game/game.cc	2026-08-04 19:34:52.365326745 +0000
++++ cur/src/game/game.cc	2026-08-04 19:34:52.572357260 +0000
+@@ -132,15 +132,30 @@
+         return -1;
+     }
+ 
++#ifdef __PS3__
++    printf("[fce] gmemory_init OK\n");
++#endif
++
+     gconfig_init(isMapper, argc, argv);
+ 
++#ifdef __PS3__
++    printf("[fce] gconfig_init OK\n");
++#endif
++
+     game_in_mapper = isMapper;
+ 
+     if (game_init_databases() == -1) {
++#ifdef __PS3__
++        printf("[fce] game_init_databases FAILED\n");
++#endif
+         gconfig_exit(false);
+         return -1;
+     }
+ 
++#ifdef __PS3__
++    printf("[fce] game_init_databases OK\n");
++#endif
++
+     win_set_minimized_title(windowTitle);
+ 
+     VideoOptions video_options;
+@@ -177,14 +192,36 @@
+         config_exit(&resolutionConfig);
+     }
+ 
++#ifdef __PS3__
++    printf("[fce] calling initWindow (%dx%d)\n", video_options.width, video_options.height);
++#endif
++
+     initWindow(&video_options, flags);
++
++#ifdef __PS3__
++    printf("[fce] initWindow OK\n");
++#endif
++
+     palette_init();
+ 
++#ifdef __PS3__
++    printf("[fce] palette_init OK\n");
++#endif
++
+     if (!game_in_mapper) {
+         game_splash_screen();
+     }
+ 
++#ifdef __PS3__
++    printf("[fce] splash OK\n");
++#endif
++
+     FMInit();
++
++#ifdef __PS3__
++    printf("[fce] FMInit OK\n");
++#endif
++
+     text_add_manager(&alias_mgr);
+     text_font(font);
+ 
+diff -ruN u/src/game/gdialog.cc cur/src/game/gdialog.cc
+--- u/src/game/gdialog.cc	2026-08-04 19:34:52.365326745 +0000
++++ cur/src/game/gdialog.cc	2026-08-04 19:34:52.867567437 +0000
+@@ -4,6 +4,13 @@
+ #include <stdio.h>
+ #include <string.h>
+ 
++#ifdef __PS3__
++#include <SDL.h>
++
++#include "platform/ps3/osk.h"
++#include "plib/gnw/kb.h"
++#endif
++
+ #include "game/actions.h"
+ #include "game/combat.h"
+ #include "game/combatai.h"
+@@ -3818,6 +3825,32 @@
+ 
+     beginTextInput();
+ 
++#ifdef __PS3__
++    // The PS3 system keyboard opens automatically for the "Tell me about" topic.
++    // Every accepted topic is processed right away and the OSK reopens for the
++    // next one; on cancel we fall through to the classic loop (exit via
++    // ESC/Start).
++    while (1) {
++        char oskText[104];
++        if (!ps3_osk_get_text("Tell me about...", "", oskText, 100)) {
++            break;
++        }
++
++        SDL_FlushEvents(SDL_JOYAXISMOTION, SDL_JOYDEVICEREMOVED);
++        kb_clear();
++
++        int topicLength = (int)strlen(oskText);
++        strncpy(about_input_string, oskText, 100);
++        about_input_index = topicLength;
++        about_input_string[about_input_index] = about_input_cursor;
++        about_input_string[about_input_index + 1] = '\0';
++        about_update_display(1);
++        about_process_string();
++    }
++    SDL_FlushEvents(SDL_JOYAXISMOTION, SDL_JOYDEVICEREMOVED);
++    kb_clear();
++#endif
++
+     while (1) {
+         sharedFpsLimiter.mark();
+ 
+diff -ruN u/src/game/loadsave.cc cur/src/game/loadsave.cc
+--- u/src/game/loadsave.cc	2026-08-04 19:34:52.369160643 +0000
++++ cur/src/game/loadsave.cc	2026-08-04 19:34:52.986418288 +0000
+@@ -5,6 +5,13 @@
+ #include <string.h>
+ #include <time.h>
+ 
++#ifdef __PS3__
++#include <SDL.h>
++
++#include "platform/ps3/osk.h"
++#include "plib/gnw/kb.h"
++#endif
++
+ #include <algorithm>
+ 
+ #include "game/automap.h"
+@@ -2187,6 +2194,46 @@
+         maxLength = 255;
+     }
+ 
++#ifdef __PS3__
++    // The PS3 system keyboard opens automatically for the save description (see
++    // get_input_str in editor.cc - same pattern). On accept the field is
++    // replaced entirely, on cancel we fall through to the classic loop.
++    {
++        char oldText[256];
++        strcpy(oldText, description);
++        int oldLength = (int)strlen(oldText);
++        oldText[oldLength] = ' ';
++        oldText[oldLength + 1] = '\0';
++        int oldWidth = text_width(oldText);
++
++        char oskText[256];
++        bool accepted = ps3_osk_get_text("", description, oskText, maxLength);
++
++        SDL_FlushEvents(SDL_JOYAXISMOTION, SDL_JOYDEVICEREMOVED);
++        kb_clear();
++
++        if (accepted) {
++            strncpy(description, oskText, maxLength);
++            description[maxLength] = '\0';
++
++            char newText[256];
++            strcpy(newText, description);
++            int newLength = (int)strlen(newText);
++            newText[newLength] = ' ';
++            newText[newLength + 1] = '\0';
++            int newWidth = text_width(newText);
++
++            int clearWidth = oldWidth > newWidth ? oldWidth : newWidth;
++            buf_fill(windowBuffer + windowWidth * y + x, clearWidth, lineHeight, windowWidth, backgroundColor);
++            text_to_buf(windowBuffer + windowWidth * y + x, newText, windowWidth, windowWidth, textColor);
++            win_draw(win);
++            renderPresent();
++
++            return 0;
++        }
++    }
++#endif
++
+     char text[256];
+     strcpy(text, description);
+ 
+diff -ruN u/src/game/main.cc cur/src/game/main.cc
+--- u/src/game/main.cc	2026-08-04 19:34:52.369160643 +0000
++++ cur/src/game/main.cc	2026-08-04 19:34:52.925075913 +0000
+@@ -1,5 +1,9 @@
+ #include "main.h"
+ 
++#ifdef __PS3__
++#include <stdio.h>
++#endif
++
+ // NOTE: Actual file name is unknown. Functions in this module do not present
+ // in debug symbols from `mapper2.exe`. In OS X binary these functions appear
+ // very far from the ones found in `mainmenu.c`, implying they are in separate
+@@ -96,9 +100,22 @@
+         return 1;
+     }
+ 
++#ifdef __PS3__
++    printf("[fce] init done, starting IPLOGO movie\n");
++#endif
++
+     gmovie_play(MOVIE_IPLOGO, GAME_MOVIE_FADE_IN);
++
++#ifdef __PS3__
++    printf("[fce] IPLOGO done, starting INTRO\n");
++#endif
++
+     gmovie_play(MOVIE_INTRO, 0);
+ 
++#ifdef __PS3__
++    printf("[fce] INTRO done, main_menu_create\n");
++#endif
++
+     if (main_menu_create() == 0) {
+         int language_filter = 1;
+         bool done = false;
+@@ -110,6 +127,10 @@
+             gsound_background_play_level_music("07desert", 11);
+             main_menu_show(1);
+ 
++#ifdef __PS3__
++            printf("[fce] main menu shown, waiting for input\n");
++#endif
++
+             mouse_show();
+             int mainMenuRc = main_menu_loop();
+             mouse_hide();
+diff -ruN u/src/movie_lib.cc cur/src/movie_lib.cc
+--- u/src/movie_lib.cc	2026-08-04 19:34:52.380662338 +0000
++++ cur/src/movie_lib.cc	2026-08-04 19:34:53.461821691 +0000
+@@ -99,7 +99,30 @@
+ 
+ static constexpr uint16_t loadUInt16LE(const uint8_t* b);
+ static constexpr uint32_t loadUInt32LE(const uint8_t* b);
+-static uint8_t getOffset(uint16_t v);
++// NOTE: the return type is uint8_t upstream - an upstream bug that clamps a
++// motion offset (which can run into the thousands) to 0-255 and corrupts
++// motion blocks. fallout2-ce does the same math in full int; fixed to int here.
++static int getOffset(uint16_t v);
++
++// The MVE stream is little-endian; this reads opcode parameters (fields laid
++// out like a u16 array) converted to host order. On a big-endian host a raw
++// v1[N] access yields the wrong value.
++static inline uint16_t mveStreamU16(const void* base, int index)
++{
++    return loadUInt16LE((const uint8_t*)base + 2 * index);
++}
++
++// Pattern ops write 4 pixels with a single u32 store and the byte layout is
++// designed for x86 (little-endian); this helper reproduces the same memory
++// layout on every host. On an LE host the compiler folds it into a plain store.
++static inline void storeUInt32LE(void* p, uint32_t v)
++{
++    uint8_t* b = (uint8_t*)p;
++    b[0] = (uint8_t)(v & 0xFF);
++    b[1] = (uint8_t)((v >> 8) & 0xFF);
++    b[2] = (uint8_t)((v >> 16) & 0xFF);
++    b[3] = (uint8_t)((v >> 24) & 0xFF);
++}
+ 
+ // 0x51EBD8
+ static int dword_51EBD8 = 0;
+@@ -693,19 +716,28 @@
+         return 0;
+     }
+ 
+-    if (~mve->field_16 - mve->field_18 != 0xFFFFEDCC) {
+-        return 0;
+-    }
++    // Header fields are little-endian in the file; reading them raw from the
++    // struct breaks validation on a BE host (26 reads as 6656, movie rejected).
++    {
++        const uint8_t* raw = (const uint8_t*)mve;
++        uint16_t field_14 = loadUInt16LE(raw + 0x14);
++        uint16_t field_16 = loadUInt16LE(raw + 0x16);
++        uint16_t field_18 = loadUInt16LE(raw + 0x18);
+ 
+-    if (mve->field_16 != 256) {
+-        return 0;
+-    }
++        if ((uint32_t)(~field_16 - field_18) != 0xFFFFEDCC) {
++            return 0;
++        }
+ 
+-    if (mve->field_14 != 26) {
+-        return 0;
+-    }
++        if (field_16 != 256) {
++            return 0;
++        }
+ 
+-    _io_next_hdr = mve->field_1A;
++        if (field_14 != 26) {
++            return 0;
++        }
++
++        _io_next_hdr = loadUInt32LE(raw + 0x1A);
++    }
+ 
+     return 1;
+ }
+@@ -871,7 +903,7 @@
+             v1 = (unsigned short*)_ioNextRecord();
+             goto LABEL_5;
+         case 2:
+-            if (!_syncInit(v1[0], v1[2])) {
++            if (!_syncInit(mveStreamU16(v1, 0), mveStreamU16(v1, 2))) {
+                 v6 = -3;
+                 break;
+             }
+@@ -880,14 +912,14 @@
+             if ((v5 >> 24) < 1) {
+                 v7 = 0;
+             } else {
+-                v7 = (v1[1] & 0x04) >> 2;
++                v7 = (mveStreamU16(v1, 1) & 0x04) >> 2;
+             }
+             v8 = loadUInt32LE((unsigned char*)v1 + 6);
+             if ((v5 >> 24) == 0) {
+                 v8 &= 0xFFFF;
+             }
+ 
+-            if (_MVE_sndConfigure(v1[0], v8, v1[1] & 0x01, v1[2], (v1[1] & 0x02) >> 1, v7)) {
++            if (_MVE_sndConfigure(mveStreamU16(v1, 0), v8, mveStreamU16(v1, 1) & 0x01, mveStreamU16(v1, 2), (mveStreamU16(v1, 1) & 0x02) >> 1, v7)) {
+                 continue;
+             }
+ 
+@@ -900,15 +932,15 @@
+         case 5:
+             v9 = 0;
+             if ((v5 >> 24) >= 2) {
+-                v9 = v1[3];
++                v9 = mveStreamU16(v1, 3);
+             }
+ 
+             v10 = 1;
+             if ((v5 >> 24) >= 1) {
+-                v10 = v1[2];
++                v10 = mveStreamU16(v1, 2);
+             }
+ 
+-            if (!_nfConfig(v1[0], v1[1], v10, v9)) {
++            if (!_nfConfig(mveStreamU16(v1, 0), mveStreamU16(v1, 1), v10, v9)) {
+                 v6 = -5;
+                 break;
+             }
+@@ -949,28 +981,28 @@
+ 
+             v18 = 0;
+             if ((v5 >> 24) >= 1) {
+-                v18 = v1[2];
++                v18 = mveStreamU16(v1, 2);
+             }
+ 
+-            v19 = v1[1];
++            v19 = mveStreamU16(v1, 1);
+             if (v19 == 0 || v21 || dword_6B3680) {
+-                _SetPalette_1(v1[0], v19);
++                _SetPalette_1(mveStreamU16(v1, 0), v19);
+             } else {
+-                _SetPalette_(v1[0], v19);
++                _SetPalette_(mveStreamU16(v1, 0), v19);
+             }
+ 
+             if (v21) {
+                 _do_nothing_(_rm_dx, _rm_dy, v21);
+-            } else if (!_sync_late || v1[1]) {
++            } else if (!_sync_late || mveStreamU16(v1, 1)) {
+                 _sfShowFrame(_rm_dx, _rm_dy, v18);
+             } else {
+                 _sync_FrameDropped = 1;
+                 ++_rm_FrameDropCount;
+             }
+ 
+-            v20 = v1[1];
++            v20 = mveStreamU16(v1, 1);
+             if (v20 && !v21 && !dword_6B3680) {
+-                _SetPalette_1(v1[0], v20);
++                _SetPalette_1(mveStreamU16(v1, 0), v20);
+             }
+ 
+             _rm_p = (unsigned char*)v1;
+@@ -980,12 +1012,12 @@
+         case 8:
+         case 9:
+             // push data to audio buffers?
+-            if (v1[1] & _rm_track_bit) {
++            if (mveStreamU16(v1, 1) & _rm_track_bit) {
+                 v14 = (unsigned char*)v1 + 6;
+                 if ((v5 >> 16) != 8) {
+                     v14 = NULL;
+                 }
+-                _CallsSndBuff_Loc(v14, v1[2]);
++                _CallsSndBuff_Loc(v14, mveStreamU16(v1, 2));
+             }
+             continue;
+         case 10:
+@@ -998,11 +1030,11 @@
+             continue;
+         case 11:
+             // some kind of palette rotation
+-            _palMakeSynthPalette(v1[0], v1[1], v1[2], v1[3], v1[4], v1[5]);
++            _palMakeSynthPalette(mveStreamU16(v1, 0), mveStreamU16(v1, 1), mveStreamU16(v1, 2), mveStreamU16(v1, 3), mveStreamU16(v1, 4), mveStreamU16(v1, 5));
+             continue;
+         case 12:
+             // palette
+-            _palLoadPalette((unsigned char*)v1 + 4, v1[0], v1[1]);
++            _palLoadPalette((unsigned char*)v1 + 4, mveStreamU16(v1, 0), mveStreamU16(v1, 1));
+             continue;
+         case 14:
+             // save current position
+@@ -1020,7 +1052,7 @@
+             }
+ 
+             // swap movie surfaces
+-            if (v1[6] & 0x01) {
++            if (mveStreamU16(v1, 6) & 0x01) {
+                 movieSwapSurfaces();
+             }
+ 
+@@ -1083,7 +1115,7 @@
+                 break;
+             }
+ 
+-            _nfPkDecomp((unsigned char*)v3, (unsigned char*)&v1[7], v1[2], v1[3], v1[4], v1[5]);
++            _nfPkDecomp((unsigned char*)v3, (unsigned char*)&v1[7], mveStreamU16(v1, 2), mveStreamU16(v1, 3), mveStreamU16(v1, 4), mveStreamU16(v1, 5));
+ 
+             // unlock
+             movieUnlockSurfaces();
+@@ -1425,7 +1457,9 @@
+ 
+     if (!_snd_comp) {
+         if (a5) {
+-            v9 = *(unsigned short*)src;
++            // The seed sample is little-endian in the stream; convert it to a
++            // host value (a raw cast yields the wrong value on BE hosts).
++            v9 = loadUInt16LE(src);
+             src += 2;
+ 
+             *(unsigned short*)dest = v9;
+@@ -1446,7 +1480,10 @@
+         v12 = loadUInt32LE(src);
+         src += 4;
+ 
+-        *(unsigned int*)dest = v12;
++        // Write the two 16-bit seeds (left/right) separately in host order;
++        // storing as u32 breaks channel/byte order on a big-endian host.
++        ((unsigned short*)dest)[0] = (unsigned short)(v12 & 0xFFFF);
++        ((unsigned short*)dest)[1] = (unsigned short)(v12 >> 16);
+         v13 = (unsigned short*)(dest + 4);
+         v14 = a3 - 4;
+     } else {
+@@ -1999,16 +2036,16 @@
+ 
+                         for (i = 0; i < 4; i++) {
+                             dest_ptr = (unsigned int*)dest;
+-                            dest_ptr[0] = (map2[map1[i * 4]] << 16) | (map2[map1[i * 4 + 1]]);
++                            storeUInt32LE(&dest_ptr[0], (map2[map1[i * 4]] << 16) | (map2[map1[i * 4 + 1]]));
+ 
+                             dest_ptr = (unsigned int*)(dest + value2);
+-                            dest_ptr[0] = (map2[map1[i * 4]] << 16) | (map2[map1[i * 4 + 1]]);
++                            storeUInt32LE(&dest_ptr[0], (map2[map1[i * 4]] << 16) | (map2[map1[i * 4 + 1]]));
+ 
+                             dest_ptr = (unsigned int*)dest;
+-                            dest_ptr[1] = (map2[map1[i * 4 + 2]] << 16) | (map2[map1[i * 4 + 3]]);
++                            storeUInt32LE(&dest_ptr[1], (map2[map1[i * 4 + 2]] << 16) | (map2[map1[i * 4 + 3]]));
+ 
+                             dest_ptr = (unsigned int*)(dest + value2);
+-                            dest_ptr[1] = (map2[map1[i * 4 + 2]] << 16) | (map2[map1[i * 4 + 3]]);
++                            storeUInt32LE(&dest_ptr[1], (map2[map1[i * 4 + 2]] << 16) | (map2[map1[i * 4 + 3]]));
+ 
+                             dest += value2 * 2;
+                         }
+@@ -2037,8 +2074,8 @@
+ 
+                         for (i = 0; i < 8; i++) {
+                             dest_ptr = (unsigned int*)dest;
+-                            dest_ptr[0] = (map2[map1[i * 4]] << 16) | map2[map1[i * 4 + 1]];
+-                            dest_ptr[1] = (map2[map1[i * 4 + 2]] << 16) | map2[map1[i * 4 + 3]];
++                            storeUInt32LE(&dest_ptr[0], (map2[map1[i * 4]] << 16) | map2[map1[i * 4 + 1]]);
++                            storeUInt32LE(&dest_ptr[1], (map2[map1[i * 4 + 2]] << 16) | map2[map1[i * 4 + 3]]);
+ 
+                             dest += value2;
+                         }
+@@ -2079,8 +2116,8 @@
+ 
+                             for (i = 0; i < 4; i++) {
+                                 dest_ptr = (unsigned int*)dest;
+-                                dest_ptr[0] = (map2[map1[i * 4]] << 16) | map2[map1[i * 4 + 1]];
+-                                dest_ptr[1] = (map2[map1[i * 4 + 2]] << 16) | map2[map1[i * 4 + 3]];
++                                storeUInt32LE(&dest_ptr[0], (map2[map1[i * 4]] << 16) | map2[map1[i * 4 + 1]]);
++                                storeUInt32LE(&dest_ptr[1], (map2[map1[i * 4 + 2]] << 16) | map2[map1[i * 4 + 3]]);
+ 
+                                 dest += value2;
+                             }
+@@ -2092,8 +2129,8 @@
+ 
+                             for (i = 0; i < 4; i++) {
+                                 dest_ptr = (unsigned int*)dest;
+-                                dest_ptr[0] = (map2[map1[16 + i * 4]] << 16) | map2[map1[16 + i * 4 + 1]];
+-                                dest_ptr[1] = (map2[map1[16 + i * 4 + 2]] << 16) | map2[map1[16 + i * 4 + 3]];
++                                storeUInt32LE(&dest_ptr[0], (map2[map1[16 + i * 4]] << 16) | map2[map1[16 + i * 4 + 1]]);
++                                storeUInt32LE(&dest_ptr[1], (map2[map1[16 + i * 4 + 2]] << 16) | map2[map1[16 + i * 4 + 3]]);
+ 
+                                 dest += value2;
+                             }
+@@ -2129,11 +2166,11 @@
+ 
+                             for (i = 0; i < 4; i++) {
+                                 dest_ptr = (unsigned int*)dest;
+-                                dest_ptr[0] = (map2[map1[i * 4]] << 16) | map2[map1[i * 4 + 1]];
++                                storeUInt32LE(&dest_ptr[0], (map2[map1[i * 4]] << 16) | map2[map1[i * 4 + 1]]);
+                                 dest += value2;
+ 
+                                 dest_ptr = (unsigned int*)dest;
+-                                dest_ptr[0] = (map2[map1[i * 4 + 2]] << 16) | map2[map1[i * 4 + 3]];
++                                storeUInt32LE(&dest_ptr[0], (map2[map1[i * 4 + 2]] << 16) | map2[map1[i * 4 + 3]]);
+                                 dest += value2;
+                             }
+ 
+@@ -2146,11 +2183,11 @@
+ 
+                             for (i = 0; i < 4; i++) {
+                                 dest_ptr = (unsigned int*)dest;
+-                                dest_ptr[0] = (map2[map1[16 + i * 4]] << 16) | map2[map1[16 + i * 4 + 1]];
++                                storeUInt32LE(&dest_ptr[0], (map2[map1[16 + i * 4]] << 16) | map2[map1[16 + i * 4 + 1]]);
+                                 dest += value2;
+ 
+                                 dest_ptr = (unsigned int*)dest;
+-                                dest_ptr[0] = (map2[map1[16 + i * 4 + 2]] << 16) | map2[map1[16 + i * 4 + 3]];
++                                storeUInt32LE(&dest_ptr[0], (map2[map1[16 + i * 4 + 2]] << 16) | map2[map1[16 + i * 4 + 3]]);
+                                 dest += value2;
+                             }
+ 
+@@ -2204,11 +2241,11 @@
+ 
+                         for (i = 0; i < 2; i++) {
+                             dest_ptr = (unsigned int*)dest;
+-                            dest_ptr[0] = (map2[map1[i * 4]] << 16) | map2[map1[i * 4 + 1]];
++                            storeUInt32LE(&dest_ptr[0], (map2[map1[i * 4]] << 16) | map2[map1[i * 4 + 1]]);
+                             dest += value2;
+ 
+                             dest_ptr = (unsigned int*)dest;
+-                            dest_ptr[0] = (map2[map1[i * 4 + 2]] << 16) | map2[map1[i * 4 + 3]];
++                            storeUInt32LE(&dest_ptr[0], (map2[map1[i * 4 + 2]] << 16) | map2[map1[i * 4 + 3]]);
+                             dest += value2;
+                         }
+ 
+@@ -2219,11 +2256,11 @@
+ 
+                         for (i = 0; i < 2; i++) {
+                             dest_ptr = (unsigned int*)dest;
+-                            dest_ptr[0] = (map2[map1[8 + i * 4]] << 16) | map2[map1[8 + i * 4 + 1]];
++                            storeUInt32LE(&dest_ptr[0], (map2[map1[8 + i * 4]] << 16) | map2[map1[8 + i * 4 + 1]]);
+                             dest += value2;
+ 
+                             dest_ptr = (unsigned int*)dest;
+-                            dest_ptr[0] = (map2[map1[8 + i * 4 + 2]] << 16) | map2[map1[8 + i * 4 + 3]];
++                            storeUInt32LE(&dest_ptr[0], (map2[map1[8 + i * 4 + 2]] << 16) | map2[map1[8 + i * 4 + 3]]);
+                             dest += value2;
+                         }
+ 
+@@ -2236,11 +2273,11 @@
+ 
+                         for (i = 0; i < 2; i++) {
+                             dest_ptr = (unsigned int*)dest;
+-                            dest_ptr[0] = (map2[map1[16 + i * 4]] << 16) | map2[map1[16 + i * 4 + 1]];
++                            storeUInt32LE(&dest_ptr[0], (map2[map1[16 + i * 4]] << 16) | map2[map1[16 + i * 4 + 1]]);
+                             dest += value2;
+ 
+                             dest_ptr = (unsigned int*)dest;
+-                            dest_ptr[0] = (map2[map1[16 + i * 4 + 2]] << 16) | map2[map1[16 + i * 4 + 3]];
++                            storeUInt32LE(&dest_ptr[0], (map2[map1[16 + i * 4 + 2]] << 16) | map2[map1[16 + i * 4 + 3]]);
+                             dest += value2;
+                         }
+ 
+@@ -2251,11 +2288,11 @@
+ 
+                         for (i = 0; i < 2; i++) {
+                             dest_ptr = (unsigned int*)dest;
+-                            dest_ptr[0] = (map2[map1[24 + i * 4]] << 16) | map2[map1[24 + i * 4 + 1]];
++                            storeUInt32LE(&dest_ptr[0], (map2[map1[24 + i * 4]] << 16) | map2[map1[24 + i * 4 + 1]]);
+                             dest += value2;
+ 
+                             dest_ptr = (unsigned int*)dest;
+-                            dest_ptr[0] = (map2[map1[24 + i * 4 + 2]] << 16) | map2[map1[24 + i * 4 + 3]];
++                            storeUInt32LE(&dest_ptr[0], (map2[map1[24 + i * 4 + 2]] << 16) | map2[map1[24 + i * 4 + 3]]);
+                             dest += value2;
+                         }
+ 
+@@ -2293,12 +2330,12 @@
+ 
+                             for (i = 0; i < 4; i++) {
+                                 dest_ptr = (unsigned int*)dest;
+-                                dest_ptr[0] = (map2[map1[i * 8]] << 16) | (map2[map1[i * 8 + 1]] << 24) | (map2[map1[i * 8 + 2]]) | (map2[map1[i * 8 + 3]] << 8);
+-                                dest_ptr[1] = (map2[map1[i * 8 + 4]] << 16) | (map2[map1[i * 8 + 5]] << 24) | (map2[map1[i * 8 + 6]]) | (map2[map1[i * 8 + 7]] << 8);
++                                storeUInt32LE(&dest_ptr[0], (map2[map1[i * 8]] << 16) | (map2[map1[i * 8 + 1]] << 24) | (map2[map1[i * 8 + 2]]) | (map2[map1[i * 8 + 3]] << 8));
++                                storeUInt32LE(&dest_ptr[1], (map2[map1[i * 8 + 4]] << 16) | (map2[map1[i * 8 + 5]] << 24) | (map2[map1[i * 8 + 6]]) | (map2[map1[i * 8 + 7]] << 8));
+ 
+                                 dest_ptr = (unsigned int*)(dest + value2);
+-                                dest_ptr[0] = (map2[map1[i * 8]] << 16) | (map2[map1[i * 8 + 1]] << 24) | (map2[map1[i * 8 + 2]]) | (map2[map1[i * 8 + 3]] << 8);
+-                                dest_ptr[1] = (map2[map1[i * 8 + 4]] << 16) | (map2[map1[i * 8 + 5]] << 24) | (map2[map1[i * 8 + 6]]) | (map2[map1[i * 8 + 7]] << 8);
++                                storeUInt32LE(&dest_ptr[0], (map2[map1[i * 8]] << 16) | (map2[map1[i * 8 + 1]] << 24) | (map2[map1[i * 8 + 2]]) | (map2[map1[i * 8 + 3]] << 8));
++                                storeUInt32LE(&dest_ptr[1], (map2[map1[i * 8 + 4]] << 16) | (map2[map1[i * 8 + 5]] << 24) | (map2[map1[i * 8 + 6]]) | (map2[map1[i * 8 + 7]] << 8));
+ 
+                                 dest += value2 * 2;
+                             }
+@@ -2331,8 +2368,8 @@
+ 
+                             for (i = 0; i < 8; i++) {
+                                 dest_ptr = (unsigned int*)dest;
+-                                dest_ptr[0] = (map2[map1[i * 4]] << 24) | (map2[map1[i * 4 + 0]] << 16) | (map2[map1[i * 4 + 1]] << 8) | (map2[map1[i * 4 + 1]]);
+-                                dest_ptr[1] = (map2[map1[i * 4 + 2]] << 24) | (map2[map1[i * 4 + 2]] << 16) | (map2[map1[i * 4 + 3]] << 8) | (map2[map1[i * 4 + 3]]);
++                                storeUInt32LE(&dest_ptr[0], (map2[map1[i * 4]] << 24) | (map2[map1[i * 4 + 0]] << 16) | (map2[map1[i * 4 + 1]] << 8) | (map2[map1[i * 4 + 1]]));
++                                storeUInt32LE(&dest_ptr[1], (map2[map1[i * 4 + 2]] << 24) | (map2[map1[i * 4 + 2]] << 16) | (map2[map1[i * 4 + 3]] << 8) | (map2[map1[i * 4 + 3]]));
+ 
+                                 dest += value2;
+                             }
+@@ -2367,14 +2404,14 @@
+ 
+                             for (i = 0; i < 4; i++) {
+                                 dest_ptr = (unsigned int*)dest;
+-                                dest_ptr[0] = (map2[map1[i * 4 + 0]] << 24) | (map2[map1[i * 4 + 0]] << 16) | (map2[map1[i * 4 + 1]] << 8) | (map2[map1[i * 4 + 1]]);
+-                                dest_ptr[1] = (map2[map1[i * 4 + 2]] << 24) | (map2[map1[i * 4 + 2]] << 16) | (map2[map1[i * 4 + 3]] << 8) | (map2[map1[i * 4 + 3]]);
++                                storeUInt32LE(&dest_ptr[0], (map2[map1[i * 4 + 0]] << 24) | (map2[map1[i * 4 + 0]] << 16) | (map2[map1[i * 4 + 1]] << 8) | (map2[map1[i * 4 + 1]]));
++                                storeUInt32LE(&dest_ptr[1], (map2[map1[i * 4 + 2]] << 24) | (map2[map1[i * 4 + 2]] << 16) | (map2[map1[i * 4 + 3]] << 8) | (map2[map1[i * 4 + 3]]));
+ 
+                                 dest += value2;
+ 
+                                 dest_ptr = (unsigned int*)dest;
+-                                dest_ptr[0] = (map2[map1[i * 4 + 0]] << 24) | (map2[map1[i * 4 + 0]] << 16) | (map2[map1[i * 4 + 1]] << 8) | (map2[map1[i * 4 + 1]]);
+-                                dest_ptr[1] = (map2[map1[i * 4 + 2]] << 24) | (map2[map1[i * 4 + 2]] << 16) | (map2[map1[i * 4 + 3]] << 8) | (map2[map1[i * 4 + 3]]);
++                                storeUInt32LE(&dest_ptr[0], (map2[map1[i * 4 + 0]] << 24) | (map2[map1[i * 4 + 0]] << 16) | (map2[map1[i * 4 + 1]] << 8) | (map2[map1[i * 4 + 1]]));
++                                storeUInt32LE(&dest_ptr[1], (map2[map1[i * 4 + 2]] << 24) | (map2[map1[i * 4 + 2]] << 16) | (map2[map1[i * 4 + 3]] << 8) | (map2[map1[i * 4 + 3]]));
+ 
+                                 dest += value2;
+                             }
+@@ -2407,8 +2444,8 @@
+ 
+                             for (i = 0; i < 8; i++) {
+                                 dest_ptr = (unsigned int*)dest;
+-                                dest_ptr[0] = (map2[map1[i * 8 + 0]] << 16) | (map2[map1[i * 8 + 1]] << 24) | (map2[map1[i * 8 + 2]]) | (map2[map1[i * 8 + 3]] << 8);
+-                                dest_ptr[1] = (map2[map1[i * 8 + 4]] << 16) | (map2[map1[i * 8 + 5]] << 24) | (map2[map1[i * 8 + 6]]) | (map2[map1[i * 8 + 7]] << 8);
++                                storeUInt32LE(&dest_ptr[0], (map2[map1[i * 8 + 0]] << 16) | (map2[map1[i * 8 + 1]] << 24) | (map2[map1[i * 8 + 2]]) | (map2[map1[i * 8 + 3]] << 8));
++                                storeUInt32LE(&dest_ptr[1], (map2[map1[i * 8 + 4]] << 16) | (map2[map1[i * 8 + 5]] << 24) | (map2[map1[i * 8 + 6]]) | (map2[map1[i * 8 + 7]] << 8));
+                                 dest += value2;
+                             }
+ 
+@@ -2453,8 +2490,8 @@
+ 
+                             for (i = 0; i < 4; i++) {
+                                 dest_ptr = (unsigned int*)dest;
+-                                dest_ptr[0] = (map2[map1[i * 8 + 0]] << 16) | (map2[map1[i * 8 + 1]] << 24) | (map2[map1[i * 8 + 2]]) | (map2[map1[i * 8 + 3]] << 8);
+-                                dest_ptr[1] = (map2[map1[i * 8 + 4]] << 16) | (map2[map1[i * 8 + 5]] << 24) | (map2[map1[i * 8 + 6]]) | (map2[map1[i * 8 + 7]] << 8);
++                                storeUInt32LE(&dest_ptr[0], (map2[map1[i * 8 + 0]] << 16) | (map2[map1[i * 8 + 1]] << 24) | (map2[map1[i * 8 + 2]]) | (map2[map1[i * 8 + 3]] << 8));
++                                storeUInt32LE(&dest_ptr[1], (map2[map1[i * 8 + 4]] << 16) | (map2[map1[i * 8 + 5]] << 24) | (map2[map1[i * 8 + 6]]) | (map2[map1[i * 8 + 7]] << 8));
+                                 dest += value2;
+                             }
+ 
+@@ -2469,8 +2506,8 @@
+ 
+                             for (i = 0; i < 4; i++) {
+                                 dest_ptr = (unsigned int*)dest;
+-                                dest_ptr[0] = (map2[map1[32 + i * 8 + 0]] << 16) | (map2[map1[32 + i * 8 + 1]] << 24) | (map2[map1[32 + i * 8 + 2]]) | (map2[map1[32 + i * 8 + 3]] << 8);
+-                                dest_ptr[1] = (map2[map1[32 + i * 8 + 4]] << 16) | (map2[map1[32 + i * 8 + 5]] << 24) | (map2[map1[32 + i * 8 + 6]]) | (map2[map1[32 + i * 8 + 7]] << 8);
++                                storeUInt32LE(&dest_ptr[0], (map2[map1[32 + i * 8 + 0]] << 16) | (map2[map1[32 + i * 8 + 1]] << 24) | (map2[map1[32 + i * 8 + 2]]) | (map2[map1[32 + i * 8 + 3]] << 8));
++                                storeUInt32LE(&dest_ptr[1], (map2[map1[32 + i * 8 + 4]] << 16) | (map2[map1[32 + i * 8 + 5]] << 24) | (map2[map1[32 + i * 8 + 6]]) | (map2[map1[32 + i * 8 + 7]] << 8));
+                                 dest += value2;
+                             }
+ 
+@@ -2510,11 +2547,11 @@
+ 
+                             for (i = 0; i < 4; i++) {
+                                 dest_ptr = (unsigned int*)dest;
+-                                dest_ptr[0] = (map2[map1[i * 8 + 0]] << 16) | (map2[map1[i * 8 + 1]] << 24) | (map2[map1[i * 8 + 2]]) | (map2[map1[i * 8 + 3]] << 8);
++                                storeUInt32LE(&dest_ptr[0], (map2[map1[i * 8 + 0]] << 16) | (map2[map1[i * 8 + 1]] << 24) | (map2[map1[i * 8 + 2]]) | (map2[map1[i * 8 + 3]] << 8));
+                                 dest += value2;
+ 
+                                 dest_ptr = (unsigned int*)dest;
+-                                dest_ptr[0] = (map2[map1[i * 8 + 4]] << 16) | (map2[map1[i * 8 + 5]] << 24) | (map2[map1[i * 8 + 6]]) | (map2[map1[i * 8 + 7]] << 8);
++                                storeUInt32LE(&dest_ptr[0], (map2[map1[i * 8 + 4]] << 16) | (map2[map1[i * 8 + 5]] << 24) | (map2[map1[i * 8 + 6]]) | (map2[map1[i * 8 + 7]] << 8));
+                                 dest += value2;
+                             }
+ 
+@@ -2531,11 +2568,11 @@
+ 
+                             for (i = 0; i < 4; i++) {
+                                 dest_ptr = (unsigned int*)dest;
+-                                dest_ptr[0] = (map2[map1[32 + i * 8 + 0]] << 16) | (map2[map1[32 + i * 8 + 1]] << 24) | (map2[map1[32 + i * 8 + 2]]) | (map2[map1[32 + i * 8 + 3]] << 8);
++                                storeUInt32LE(&dest_ptr[0], (map2[map1[32 + i * 8 + 0]] << 16) | (map2[map1[32 + i * 8 + 1]] << 24) | (map2[map1[32 + i * 8 + 2]]) | (map2[map1[32 + i * 8 + 3]] << 8));
+                                 dest += value2;
+ 
+                                 dest_ptr = (unsigned int*)dest;
+-                                dest_ptr[0] = (map2[map1[32 + i * 8 + 4]] << 16) | (map2[map1[32 + i * 8 + 5]] << 24) | (map2[map1[32 + i * 8 + 6]]) | (map2[map1[32 + i * 8 + 7]] << 8);
++                                storeUInt32LE(&dest_ptr[0], (map2[map1[32 + i * 8 + 4]] << 16) | (map2[map1[32 + i * 8 + 5]] << 24) | (map2[map1[32 + i * 8 + 6]]) | (map2[map1[32 + i * 8 + 7]] << 8));
+                                 dest += value2;
+                             }
+ 
+@@ -2593,11 +2630,11 @@
+ 
+                         for (i = 0; i < 2; i++) {
+                             dest_ptr = (unsigned int*)dest;
+-                            dest_ptr[0] = (map2[map1[i * 8 + 0]] << 16) | (map2[map1[i * 8 + 1]] << 24) | (map2[map1[i * 8 + 2]]) | (map2[map1[i * 8 + 3]] << 8);
++                            storeUInt32LE(&dest_ptr[0], (map2[map1[i * 8 + 0]] << 16) | (map2[map1[i * 8 + 1]] << 24) | (map2[map1[i * 8 + 2]]) | (map2[map1[i * 8 + 3]] << 8));
+                             dest += value2;
+ 
+                             dest_ptr = (unsigned int*)dest;
+-                            dest_ptr[0] = (map2[map1[i * 8 + 4]] << 16) | (map2[map1[i * 8 + 5]] << 24) | (map2[map1[i * 8 + 6]]) | (map2[map1[i * 8 + 7]] << 8);
++                            storeUInt32LE(&dest_ptr[0], (map2[map1[i * 8 + 4]] << 16) | (map2[map1[i * 8 + 5]] << 24) | (map2[map1[i * 8 + 6]]) | (map2[map1[i * 8 + 7]] << 8));
+                             dest += value2;
+                         }
+ 
+@@ -2612,11 +2649,11 @@
+ 
+                         for (i = 0; i < 2; i++) {
+                             dest_ptr = (unsigned int*)dest;
+-                            dest_ptr[0] = (map2[map1[16 + i * 8 + 0]] << 16) | (map2[map1[16 + i * 8 + 1]] << 24) | (map2[map1[16 + i * 8 + 2]]) | (map2[map1[16 + i * 8 + 3]] << 8);
++                            storeUInt32LE(&dest_ptr[0], (map2[map1[16 + i * 8 + 0]] << 16) | (map2[map1[16 + i * 8 + 1]] << 24) | (map2[map1[16 + i * 8 + 2]]) | (map2[map1[16 + i * 8 + 3]] << 8));
+                             dest += value2;
+ 
+                             dest_ptr = (unsigned int*)dest;
+-                            dest_ptr[0] = (map2[map1[16 + i * 8 + 4]] << 16) | (map2[map1[16 + i * 8 + 5]] << 24) | (map2[map1[16 + i * 8 + 6]]) | (map2[map1[16 + i * 8 + 7]] << 8);
++                            storeUInt32LE(&dest_ptr[0], (map2[map1[16 + i * 8 + 4]] << 16) | (map2[map1[16 + i * 8 + 5]] << 24) | (map2[map1[16 + i * 8 + 6]]) | (map2[map1[16 + i * 8 + 7]] << 8));
+                             dest += value2;
+                         }
+ 
+@@ -2633,11 +2670,11 @@
+ 
+                         for (i = 0; i < 2; i++) {
+                             dest_ptr = (unsigned int*)dest;
+-                            dest_ptr[0] = (map2[map1[32 + i * 8 + 0]] << 16) | (map2[map1[32 + i * 8 + 1]] << 24) | (map2[map1[32 + i * 8 + 2]]) | (map2[map1[32 + i * 8 + 3]] << 8);
++                            storeUInt32LE(&dest_ptr[0], (map2[map1[32 + i * 8 + 0]] << 16) | (map2[map1[32 + i * 8 + 1]] << 24) | (map2[map1[32 + i * 8 + 2]]) | (map2[map1[32 + i * 8 + 3]] << 8));
+                             dest += value2;
+ 
+                             dest_ptr = (unsigned int*)dest;
+-                            dest_ptr[0] = (map2[map1[32 + i * 8 + 4]] << 16) | (map2[map1[32 + i * 8 + 5]] << 24) | (map2[map1[32 + i * 8 + 6]]) | (map2[map1[32 + i * 8 + 7]] << 8);
++                            storeUInt32LE(&dest_ptr[0], (map2[map1[32 + i * 8 + 4]] << 16) | (map2[map1[32 + i * 8 + 5]] << 24) | (map2[map1[32 + i * 8 + 6]]) | (map2[map1[32 + i * 8 + 7]] << 8));
+                             dest += value2;
+                         }
+ 
+@@ -2652,11 +2689,11 @@
+ 
+                         for (i = 0; i < 2; i++) {
+                             dest_ptr = (unsigned int*)dest;
+-                            dest_ptr[0] = (map2[map1[48 + i * 8 + 0]] << 16) | (map2[map1[48 + i * 8 + 1]] << 24) | (map2[map1[48 + i * 8 + 2]]) | (map2[map1[48 + i * 8 + 3]] << 8);
++                            storeUInt32LE(&dest_ptr[0], (map2[map1[48 + i * 8 + 0]] << 16) | (map2[map1[48 + i * 8 + 1]] << 24) | (map2[map1[48 + i * 8 + 2]]) | (map2[map1[48 + i * 8 + 3]] << 8));
+                             dest += value2;
+ 
+                             dest_ptr = (unsigned int*)dest;
+-                            dest_ptr[0] = (map2[map1[48 + i * 8 + 4]] << 16) | (map2[map1[48 + i * 8 + 5]] << 24) | (map2[map1[48 + i * 8 + 6]]) | (map2[map1[48 + i * 8 + 7]] << 8);
++                            storeUInt32LE(&dest_ptr[0], (map2[map1[48 + i * 8 + 4]] << 16) | (map2[map1[48 + i * 8 + 5]] << 24) | (map2[map1[48 + i * 8 + 6]]) | (map2[map1[48 + i * 8 + 7]] << 8));
+                             dest += value2;
+                         }
+ 
+@@ -2697,12 +2734,12 @@
+                         value2 |= (byte << 16) | (byte << 24);
+ 
+                         dest_ptr = (unsigned int*)dest;
+-                        dest_ptr[0] = value1;
+-                        dest_ptr[1] = value2;
++                        storeUInt32LE(&dest_ptr[0], value1);
++                        storeUInt32LE(&dest_ptr[1], value2);
+ 
+                         dest_ptr = (unsigned int*)(dest + _mveBW);
+-                        dest_ptr[0] = value1;
+-                        dest_ptr[1] = value2;
++                        storeUInt32LE(&dest_ptr[0], value1);
++                        storeUInt32LE(&dest_ptr[1], value2);
+ 
+                         dest += _mveBW * 2;
+                     }
+@@ -2721,12 +2758,12 @@
+ 
+                     for (i = 0; i < 2; i++) {
+                         dest_ptr = (unsigned int*)dest;
+-                        dest_ptr[0] = value1;
+-                        dest_ptr[1] = value2;
++                        storeUInt32LE(&dest_ptr[0], value1);
++                        storeUInt32LE(&dest_ptr[1], value2);
+ 
+                         dest_ptr = (unsigned int*)(dest + _mveBW);
+-                        dest_ptr[0] = value1;
+-                        dest_ptr[1] = value2;
++                        storeUInt32LE(&dest_ptr[0], value1);
++                        storeUInt32LE(&dest_ptr[1], value2);
+ 
+                         dest += _mveBW * 2;
+                     }
+@@ -2739,12 +2776,12 @@
+ 
+                     for (i = 0; i < 2; i++) {
+                         dest_ptr = (unsigned int*)dest;
+-                        dest_ptr[0] = value1;
+-                        dest_ptr[1] = value2;
++                        storeUInt32LE(&dest_ptr[0], value1);
++                        storeUInt32LE(&dest_ptr[1], value2);
+ 
+                         dest_ptr = (unsigned int*)(dest + _mveBW);
+-                        dest_ptr[0] = value1;
+-                        dest_ptr[1] = value2;
++                        storeUInt32LE(&dest_ptr[0], value1);
++                        storeUInt32LE(&dest_ptr[1], value2);
+ 
+                         dest += _mveBW * 2;
+                     }
+@@ -2770,13 +2807,13 @@
+ 
+                     for (i = 0; i < 4; i++) {
+                         dest_ptr = (unsigned int*)dest;
+-                        dest_ptr[0] = value1;
+-                        dest_ptr[1] = value1;
++                        storeUInt32LE(&dest_ptr[0], value1);
++                        storeUInt32LE(&dest_ptr[1], value1);
+                         dest += _mveBW;
+ 
+                         dest_ptr = (unsigned int*)dest;
+-                        dest_ptr[0] = value2;
+-                        dest_ptr[1] = value2;
++                        storeUInt32LE(&dest_ptr[0], value2);
++                        storeUInt32LE(&dest_ptr[1], value2);
+                         dest += _mveBW;
+                     }
+ 
+@@ -2802,7 +2839,7 @@
+     return (b[3] << 24) | (b[2] << 16) | (b[1] << 8) | b[0];
+ }
+ 
+-uint8_t getOffset(uint16_t v)
++int getOffset(uint16_t v)
+ {
+     return static_cast<int8_t>(v & 0xFF) + dword_51F018[v >> 8];
+ }
+diff -ruN u/src/platform/ps3/osk.cc cur/src/platform/ps3/osk.cc
+--- u/src/platform/ps3/osk.cc	1970-01-01 00:00:00.000000000 +0000
++++ cur/src/platform/ps3/osk.cc	2026-08-04 19:34:53.496326777 +0000
+@@ -0,0 +1,147 @@
++// PS3 system on-screen keyboard (sysutil OSK) integration.
++//
++// Flow (same skeleton as the PSL1GHT osk sample):
++//   sysMemContainerCreate -> sysUtilRegisterCallback -> oskLoadAsync
++//   -> [every frame: sysUtilCheckCallback + refresh the screen] -> DONE/CANCELED
++//   -> oskUnloadAsync -> cleanup.
++// The screen must keep refreshing while the dialog is up (flip chain) -
++// otherwise the OSK stays invisible; that is why the loop calls win_refresh_all.
++
++#include "platform/ps3/osk.h"
++
++#include <stdio.h>
++#include <string.h>
++
++#include <SDL.h>
++
++#include <sys/memory.h>
++#include <sysutil/osk.h>
++#include <sysutil/sysutil.h>
++
++#include "plib/gnw/gnw.h"
++#include "plib/gnw/svga.h"
++
++namespace fallout {
++
++#define PS3_OSK_MAX_LEN 64
++#define PS3_OSK_MEM_CONTAINER_SIZE (4 * 1024 * 1024)
++
++enum Ps3OskState {
++    PS3_OSK_RUNNING,
++    PS3_OSK_DONE,
++    PS3_OSK_CANCELED
++};
++
++static volatile int s_oskState = PS3_OSK_CANCELED;
++static u16 s_resultText[PS3_OSK_MAX_LEN + 1];
++static oskCallbackReturnParam s_returnParam;
++
++static void ascii_to_utf16(u16* dst, const char* src, int maxLength)
++{
++    int i;
++    for (i = 0; i < maxLength && src[i] != '\0'; i++) {
++        dst[i] = (u16)(unsigned char)src[i];
++    }
++    dst[i] = 0;
++}
++
++static void utf16_to_ascii(char* dst, const u16* src, int maxLength)
++{
++    int i;
++    for (i = 0; i < maxLength && src[i] != 0; i++) {
++        dst[i] = (src[i] < 128) ? (char)src[i] : '?';
++    }
++    dst[i] = '\0';
++}
++
++static void ps3_osk_event_handler(u64 status, u64 param, void* userdata)
++{
++    switch (status) {
++    case SYSUTIL_OSK_INPUT_ENTERED:
++        oskGetInputText(&s_returnParam);
++        break;
++    case SYSUTIL_OSK_INPUT_CANCELED:
++        oskAbort();
++        break;
++    case SYSUTIL_OSK_DONE:
++        oskUnloadAsync(&s_returnParam);
++        s_oskState = (s_returnParam.res == OSK_OK) ? PS3_OSK_DONE : PS3_OSK_CANCELED;
++        break;
++    default:
++        break;
++    }
++}
++
++bool ps3_osk_get_text(const char* title, const char* initial, char* out, int maxLength)
++{
++    out[0] = '\0';
++
++    if (maxLength > PS3_OSK_MAX_LEN) {
++        maxLength = PS3_OSK_MAX_LEN;
++    }
++
++    sys_mem_container_t container;
++    if (sysMemContainerCreate(&container, PS3_OSK_MEM_CONTAINER_SIZE) != 0) {
++        printf("[fce] osk: sysMemContainerCreate failed\n");
++        return false;
++    }
++
++    static u16 message[64];
++    static u16 startText[PS3_OSK_MAX_LEN + 1];
++    ascii_to_utf16(message, title, 63);
++    ascii_to_utf16(startText, initial != NULL ? initial : "", PS3_OSK_MAX_LEN);
++
++    oskParam param;
++    memset(&param, 0, sizeof(param));
++    param.allowedPanels = OSK_PANEL_TYPE_LATIN | OSK_PANEL_TYPE_ENGLISH | OSK_PANEL_TYPE_NUMERAL;
++    param.firstViewPanel = OSK_PANEL_TYPE_LATIN;
++    param.controlPoint.x = 0.0f;
++    param.controlPoint.y = 0.0f;
++    param.prohibitFlags = OSK_PROHIBIT_RETURN;
++
++    oskInputFieldInfo field;
++    memset(&field, 0, sizeof(field));
++    field.message = message;
++    field.startText = startText;
++    field.maxLength = maxLength;
++
++    memset(s_resultText, 0, sizeof(s_resultText));
++    s_returnParam.res = OSK_CANCELED;
++    s_returnParam.len = maxLength;
++    s_returnParam.str = s_resultText;
++    s_oskState = PS3_OSK_RUNNING;
++
++    if (sysUtilRegisterCallback(SYSUTIL_EVENT_SLOT1, ps3_osk_event_handler, NULL) != 0) {
++        printf("[fce] osk: sysUtilRegisterCallback failed\n");
++        sysMemContainerDestroy(container);
++        return false;
++    }
++
++    oskSetInitialInputDevice(OSK_DEVICE_PAD);
++
++    if (oskLoadAsync(container, &param, &field) != 0) {
++        printf("[fce] osk: oskLoadAsync failed\n");
++        sysUtilUnregisterCallback(SYSUTIL_EVENT_SLOT1);
++        sysMemContainerDestroy(container);
++        return false;
++    }
++
++    while (s_oskState == PS3_OSK_RUNNING) {
++        sysUtilCheckCallback();
++        // Refresh the screen so the flip chain does not stall under the dialog.
++        win_refresh_all(&scr_size);
++        SDL_Delay(16);
++    }
++
++    sysUtilUnregisterCallback(SYSUTIL_EVENT_SLOT1);
++    sysMemContainerDestroy(container);
++
++    if (s_oskState != PS3_OSK_DONE) {
++        return false;
++    }
++
++    utf16_to_ascii(out, s_resultText, maxLength);
++    return out[0] != '\0';
++}
++
++} // namespace fallout
+diff -ruN u/src/platform/ps3/osk.h cur/src/platform/ps3/osk.h
+--- u/src/platform/ps3/osk.h	1970-01-01 00:00:00.000000000 +0000
++++ cur/src/platform/ps3/osk.h	2026-08-04 19:34:53.488658980 +0000
+@@ -0,0 +1,14 @@
++#ifndef FALLOUT_PLATFORM_PS3_OSK_H_
++#define FALLOUT_PLATFORM_PS3_OSK_H_
++
++namespace fallout {
++
++// Opens the PS3 system on-screen keyboard (OSK) modally.
++// initial: current contents of the field (OSK opens prefilled; NULL/"" = empty).
++// If the user confirms, ASCII text is written to out and true is returned;
++// false on cancel/error. maxLength is the character limit excluding the NUL.
++bool ps3_osk_get_text(const char* title, const char* initial, char* out, int maxLength);
++
++} // namespace fallout
++
++#endif /* FALLOUT_PLATFORM_PS3_OSK_H_ */
+diff -ruN u/src/platform/ps3/paths.h cur/src/platform/ps3/paths.h
+--- u/src/platform/ps3/paths.h	1970-01-01 00:00:00.000000000 +0000
++++ cur/src/platform/ps3/paths.h	2026-08-04 19:34:53.492492879 +0000
+@@ -0,0 +1,16 @@
++#ifndef FALLOUT_PLATFORM_PS3_PATHS_H_
++#define FALLOUT_PLATFORM_PS3_PATHS_H_
++
++// Fixed location of the game data on PS3 - path resolution is driven ONLY here.
++//
++// The player copies these files here from their own legal copy:
++//   MASTER.DAT, CRITTER.DAT, DATA/, fallout.cfg (optional)
++//
++// Real PS3 : /dev_hdd0/game/FALL1CE00/USRDIR/
++// RPCS3    : <rpcs3>/dev_hdd0/game/FALL1CE00/USRDIR/
++//
++// FALL1CE00 must match the .pkg TITLE_ID, so that on pkg install EBOOT.BIN and
++// the data end up in the same folder. Savegames are written here as well.
++#define PS3_GAME_DATA_PATH "/dev_hdd0/game/FALL1CE00/USRDIR"
++
++#endif /* FALLOUT_PLATFORM_PS3_PATHS_H_ */
+diff -ruN u/src/platform_compat.cc cur/src/platform_compat.cc
+--- u/src/platform_compat.cc	2026-08-04 19:34:52.380662338 +0000
++++ cur/src/platform_compat.cc	2026-08-04 19:34:53.457987793 +0000
+@@ -25,6 +25,12 @@
+ 
+ #include <SDL.h>
+ 
++#ifdef __PS3__
++#include <stdio.h>
++
++#include "platform/ps3/paths.h"
++#endif
++
+ namespace fallout {
+ 
+ int compat_stricmp(const char* string1, const char* string2)
+@@ -286,18 +292,104 @@
+ #endif
+ }
+ 
++#ifdef __PS3__
++// PS3/newlib: open/opendir do not join relative paths with the CWD, the lv2 fs
++// layer wants an absolute path. All relative paths get rooted at the data dir
++// in one place. (compat_resolve_path runs before every file operation, so this
++// is the choke point - compat_fopen/mkdir/remove/rename and db_findfirst.)
++static void compat_ps3_absolute_path(char* path)
++{
++    if (path[0] == '/') {
++        return;
++    }
++
++    const char* src = path;
++    if (src[0] == '.' && src[1] == '/') {
++        src += 2;
++    } else if (src[0] == '.' && src[1] == '\0') {
++        src += 1;
++    }
++
++    char temp[COMPAT_MAX_PATH];
++    if (src[0] == '\0') {
++        snprintf(temp, sizeof(temp), "%s", PS3_GAME_DATA_PATH);
++    } else {
++        snprintf(temp, sizeof(temp), "%s/%s", PS3_GAME_DATA_PATH, src);
++    }
++    strcpy(path, temp);
++}
++#endif
++
++#ifdef __PS3__
++// Cache of resolved paths. The engine opens the same file over and over
++// (especially the hundreds of .ACMs under DATA/SOUND/SFX), and every open
++// means a directory scan. Without the cache, host-side memory balloons on
++// RPCS3 and there is visible slowdown on real PS3.
++//
++// Failed resolutions are cached too: the engine first looks for the hundreds
++// of in-DAT sounds as external files, fails, and retries - uncached, every
++// attempt rescans a crowded directory. Storing this is harmless because an
++// unresolved path is returned unchanged; files the engine creates later
++// (saves) are then opened with the exact spelling it asked for.
++#define PS3_PATH_CACHE_SIZE 512
++
++struct Ps3PathCacheEntry {
++    char key[COMPAT_MAX_PATH];
++    char value[COMPAT_MAX_PATH];
++};
++
++static Ps3PathCacheEntry gPs3PathCache[PS3_PATH_CACHE_SIZE];
++
++static unsigned int ps3PathHash(const char* s)
++{
++    unsigned int h = 2166136261u;
++    while (*s != '\0') {
++        h = (h ^ (unsigned char)*s++) * 16777619u;
++    }
++    return h % PS3_PATH_CACHE_SIZE;
++}
++#endif
++
+ void compat_resolve_path(char* path)
+ {
++#ifdef __PS3__
++    compat_ps3_absolute_path(path);
++
++    Ps3PathCacheEntry* cacheEntry = &gPs3PathCache[ps3PathHash(path)];
++    if (strcmp(cacheEntry->key, path) == 0) {
++        strcpy(path, cacheEntry->value);
++        return;
++    }
++
++    char cacheKey[COMPAT_MAX_PATH];
++    strcpy(cacheKey, path);
++#endif
+ #ifndef _WIN32
+     char* pch = path;
+ 
+     DIR* dir;
++#ifdef __PS3__
++    // The fixed data root (PS3_GAME_DATA_PATH) is already spelled correctly,
++    // so start case resolution AFTER the root. Otherwise every file open
++    // scans 5 directories starting from "/" - slowdown on real PS3, and on
++    // RPCS3 host-side memory bloat that builds up within hours.
++    if (strncmp(pch, PS3_GAME_DATA_PATH "/", strlen(PS3_GAME_DATA_PATH) + 1) == 0) {
++        pch += strlen(PS3_GAME_DATA_PATH) + 1;
++        dir = opendir(PS3_GAME_DATA_PATH);
++    } else if (pch[0] == '/') {
++        dir = opendir("/");
++        pch++;
++    } else {
++        dir = opendir(".");
++    }
++#else
+     if (pch[0] == '/') {
+         dir = opendir("/");
+         pch++;
+     } else {
+         dir = opendir(".");
+     }
++#endif
+ 
+     while (dir != NULL) {
+         char* sep = strchr(pch, '/');
+@@ -338,6 +430,11 @@
+         pch = sep + 1;
+     }
+ #endif
++
++#ifdef __PS3__
++    strcpy(cacheEntry->key, cacheKey);
++    strcpy(cacheEntry->value, path);
++#endif
+ }
+ 
+ char* compat_strdup(const char* string)
+diff -ruN u/src/plib/gnw/dxinput.cc cur/src/plib/gnw/dxinput.cc
+--- u/src/plib/gnw/dxinput.cc	2026-08-04 19:34:52.384496237 +0000
++++ cur/src/plib/gnw/dxinput.cc	2026-08-04 19:34:53.431150504 +0000
+@@ -10,6 +10,30 @@
+ static int gMouseWheelDeltaX = 0;
+ static int gMouseWheelDeltaY = 0;
+ 
++#ifdef __PS3__
++// DS3/DualSense -> mouse emulation:
++//   LEFT stick = cursor (so the right thumb can stay on X while dragging),
++//   X = left click, O = right click, R2 = speed up.
++// PSL1GHT joystick driver: axes L=(0,1) R=(2,3), buttons in SDL_sysjoystick.c
++#define PS3_AXIS_CURSOR_H 0
++#define PS3_AXIS_CURSOR_V 1
++#define PS3_BTN_CROSS 9
++#define PS3_BTN_CIRCLE 10
++#define PS3_BTN_R2 14
++#define PS3_AXIS_DEADZONE 8000
++// The axis value is divided by this to get the pixel delta (smaller = faster).
++#define PS3_AXIS_DIVISOR 4096
++
++static SDL_Joystick* gPs3Joystick = NULL;
++
++static void ps3JoystickEnsureOpen()
++{
++    if (gPs3Joystick == NULL && SDL_NumJoysticks() > 0) {
++        gPs3Joystick = SDL_JoystickOpen(0);
++    }
++}
++#endif
++
+ // 0x4E0400
+ bool dxinput_init()
+ {
+@@ -17,6 +41,15 @@
+         return false;
+     }
+ 
++#ifdef __PS3__
++    // The engine never opens this subsystem because it does not use joysticks
++    // on PC; without it SDL_NumJoysticks() always returns 0 and the
++    // gamepad->mouse emulation (dxinput_get_mouse_state) never kicks in.
++    if (SDL_InitSubSystem(SDL_INIT_JOYSTICK) != 0) {
++        printf("[fce] SDL joystick subsystem failed: %s\n", SDL_GetError());
++    }
++#endif
++
+     if (!dxinput_mouse_init()) {
+         goto err;
+     }
+@@ -66,6 +99,34 @@
+     Uint32 buttons = SDL_GetRelativeMouseState(&(mouseState->x), &(mouseState->y));
+     mouseState->buttons[0] = (buttons & SDL_BUTTON(SDL_BUTTON_LEFT)) != 0;
+     mouseState->buttons[1] = (buttons & SDL_BUTTON(SDL_BUTTON_RIGHT)) != 0;
++
++#ifdef __PS3__
++    // Feed the gamepad into the engine as if it were a mouse. If a real USB
++    // mouse is present, the SDL values above keep flowing too (free bonus).
++    ps3JoystickEnsureOpen();
++    if (gPs3Joystick != NULL) {
++        Sint16 ax = SDL_JoystickGetAxis(gPs3Joystick, PS3_AXIS_CURSOR_H);
++        Sint16 ay = SDL_JoystickGetAxis(gPs3Joystick, PS3_AXIS_CURSOR_V);
++        if (ax > -PS3_AXIS_DEADZONE && ax < PS3_AXIS_DEADZONE) ax = 0;
++        if (ay > -PS3_AXIS_DEADZONE && ay < PS3_AXIS_DEADZONE) ay = 0;
++
++        int divisor = PS3_AXIS_DIVISOR;
++        if (SDL_JoystickGetButton(gPs3Joystick, PS3_BTN_R2)) {
++            divisor /= 3;
++        }
++
++        mouseState->x += ax / divisor;
++        mouseState->y += ay / divisor;
++
++        if (SDL_JoystickGetButton(gPs3Joystick, PS3_BTN_CROSS)) {
++            mouseState->buttons[0] = true;
++        }
++        if (SDL_JoystickGetButton(gPs3Joystick, PS3_BTN_CIRCLE)) {
++            mouseState->buttons[1] = true;
++        }
++    }
++#endif
++
+     mouseState->wheelX = gMouseWheelDeltaX;
+     mouseState->wheelY = gMouseWheelDeltaY;
+ 
+@@ -103,7 +164,14 @@
+ // 0x4E070C
+ bool dxinput_mouse_init()
+ {
++#ifdef __PS3__
++    // Relative mouse mode is unsupported on PSL1GHT; not treated as fatal.
++    // The cursor is driven by the analog stick (dxinput_get_mouse_state).
++    SDL_SetRelativeMouseMode(SDL_TRUE);
++    return true;
++#else
+     return SDL_SetRelativeMouseMode(SDL_TRUE) == 0;
++#endif
+ }
+ 
+ // 0x4E078C
+@@ -122,6 +190,20 @@
+ {
+ }
+ 
++#ifdef __PS3__
++void dxinput_ps3_right_stick(Sint16* rx, Sint16* ry)
++{
++    ps3JoystickEnsureOpen();
++    if (gPs3Joystick != NULL) {
++        *rx = SDL_JoystickGetAxis(gPs3Joystick, 2);
++        *ry = SDL_JoystickGetAxis(gPs3Joystick, 3);
++    } else {
++        *rx = 0;
++        *ry = 0;
++    }
++}
++#endif
++
+ void handleMouseEvent(SDL_Event* event)
+ {
+     // Mouse movement and buttons are accumulated in SDL itself and will be
+diff -ruN u/src/plib/gnw/dxinput.h cur/src/plib/gnw/dxinput.h
+--- u/src/plib/gnw/dxinput.h	2026-08-04 19:34:52.384496237 +0000
++++ cur/src/plib/gnw/dxinput.h	2026-08-04 19:34:53.408147114 +0000
+@@ -30,6 +30,11 @@
+ 
+ void handleMouseEvent(SDL_Event* event);
+ 
++#ifdef __PS3__
++// Raw state of the right analog stick (for map scrolling - used by input.cc).
++void dxinput_ps3_right_stick(Sint16* rx, Sint16* ry);
++#endif
++
+ } // namespace fallout
+ 
+ #endif /* FALLOUT_PLIB_GNW_DXINPUT_H_ */
+diff -ruN u/src/plib/gnw/gnw.cc cur/src/plib/gnw/gnw.cc
+--- u/src/plib/gnw/gnw.cc	2026-08-04 19:34:52.384496237 +0000
++++ cur/src/plib/gnw/gnw.cc	2026-08-04 19:34:53.415814911 +0000
+@@ -2,6 +2,10 @@
+ 
+ #include <algorithm>
+ 
++#ifdef __PS3__
++#include <stdio.h>
++#endif
++
+ #include "game/palette.h"
+ #include "plib/color/color.h"
+ #include "plib/db/db.h"
+@@ -1319,6 +1323,10 @@
+ // 0x4C42B8
+ bool GNWSystemError(const char* text)
+ {
++#ifdef __PS3__
++    // No SDL message box on PS3; print the error reason to the TTY as well.
++    printf("[fce] GNWSystemError: %s", text);
++#endif
+     SDL_Cursor* prev = SDL_GetCursor();
+     SDL_Cursor* cursor = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_ARROW);
+     SDL_SetCursor(cursor);
+diff -ruN u/src/plib/gnw/input.cc cur/src/plib/gnw/input.cc
+--- u/src/plib/gnw/input.cc	2026-08-04 19:34:52.384496237 +0000
++++ cur/src/plib/gnw/input.cc	2026-08-04 19:34:53.434984403 +0000
+@@ -20,6 +20,44 @@
+ 
+ namespace fallout {
+ 
++#ifdef __PS3__
++// Gamepad button -> keyboard shortcut mapping (the game's own keys were
++// verified against game.cc/combat.cc). X/O/R2 are handled as mouse input
++// in dxinput, L3/R3 are reserved for the custom menu. For text input the
++// OSK opens AUTOMATICALLY inside win_input_str (intrface.cc) - no trigger here.
++// PSL1GHT button indices: L=0 D=1 R=2 U=3 Start=4 R3=5 L3=6 Sel=7
++//                         Square=8 X=9 O=10 Triangle=11 R1=12 L1=13 R2=14 L2=15
++static int ps3_joy_button_to_scancode(int button)
++{
++    switch (button) {
++    case 8: // Square
++        return SDL_SCANCODE_I; // inventory
++    case 11: // Triangle
++        return SDL_SCANCODE_C; // character screen
++    case 12: // R1
++        return SDL_SCANCODE_N; // toggle weapon mode (intface_toggle_item_state)
++    case 13: // L1
++        return SDL_SCANCODE_B; // swap hand (slot 1<->2)
++    case 15: // L2
++        return SDL_SCANCODE_SPACE; // end turn (combat)
++    case 4: // Start
++        return SDL_SCANCODE_ESCAPE; // game menu
++    case 7: // Select
++        return SDL_SCANCODE_TAB; // automap
++    case 3: // D-pad up
++        return SDL_SCANCODE_P; // PIP-Boy
++    case 1: // D-pad down
++        return SDL_SCANCODE_S; // Skilldex
++    case 0: // D-pad left
++        return SDL_SCANCODE_A; // enter combat
++    case 2: // D-pad right
++        return SDL_SCANCODE_RETURN; // end combat
++    default:
++        return SDL_SCANCODE_UNKNOWN;
++    }
++}
++#endif
++
+ typedef struct GNW95RepeatStruct {
+     // Time when appropriate key was pressed down or -1 if it's up.
+     unsigned int time;
+@@ -1078,6 +1116,43 @@
+ {
+ }
+ 
++#ifdef __PS3__
++// Right stick -> virtual arrow keys -> map_scroll (game.cc already handles
++// KEY_ARROW_*). The engine's key-repeat keeps scrolling while held down.
++static void ps3_process_right_stick_scroll()
++{
++    static const int kThreshold = 16000;
++    static const int kScancodes[4] = {
++        SDL_SCANCODE_LEFT, SDL_SCANCODE_RIGHT, SDL_SCANCODE_UP, SDL_SCANCODE_DOWN
++    };
++    static bool held[4];
++
++    if (kb_is_disabled()) {
++        return;
++    }
++
++    Sint16 rx;
++    Sint16 ry;
++    dxinput_ps3_right_stick(&rx, &ry);
++
++    bool want[4];
++    want[0] = rx < -kThreshold;
++    want[1] = rx > kThreshold;
++    want[2] = ry < -kThreshold;
++    want[3] = ry > kThreshold;
++
++    KeyboardData keyboardData;
++    for (int i = 0; i < 4; i++) {
++        if (want[i] != held[i]) {
++            held[i] = want[i];
++            keyboardData.key = kScancodes[i];
++            keyboardData.down = want[i] ? 1 : 0;
++            GNW95_process_key(&keyboardData);
++        }
++    }
++}
++#endif
++
+ // 0x4B4538
+ void GNW95_process_message()
+ {
+@@ -1112,6 +1187,19 @@
+                 GNW95_process_key(&keyboardData);
+             }
+             break;
++#ifdef __PS3__
++        case SDL_JOYBUTTONDOWN:
++        case SDL_JOYBUTTONUP:
++            if (!kb_is_disabled()) {
++                int scancode = ps3_joy_button_to_scancode(e.jbutton.button);
++                if (scancode != SDL_SCANCODE_UNKNOWN) {
++                    keyboardData.key = scancode;
++                    keyboardData.down = (e.jbutton.state == SDL_PRESSED);
++                    GNW95_process_key(&keyboardData);
++                }
++            }
++            break;
++#endif
+         case SDL_WINDOWEVENT:
+             switch (e.window.event) {
+             case SDL_WINDOWEVENT_EXPOSED:
+@@ -1140,6 +1228,10 @@
+ 
+     touch_process_gesture();
+ 
++#ifdef __PS3__
++    ps3_process_right_stick_scroll();
++#endif
++
+     if (GNW95_isActive && !kb_is_disabled()) {
+         // NOTE: Uninline
+         unsigned int tick = get_time();
+diff -ruN u/src/plib/gnw/intrface.cc cur/src/plib/gnw/intrface.cc
+--- u/src/plib/gnw/intrface.cc	2026-08-04 19:34:52.384496237 +0000
++++ cur/src/plib/gnw/intrface.cc	2026-08-04 19:34:53.427316606 +0000
+@@ -14,6 +14,15 @@
+ #include "plib/gnw/svga.h"
+ #include "plib/gnw/text.h"
+ 
++#ifdef __PS3__
++#include <SDL.h>
++
++#include "platform/ps3/osk.h"
++#include "plib/gnw/kb.h"
++
++#define PS3_OSK_BUF_LEN 128
++#endif
++
+ namespace fallout {
+ 
+ static int create_pull_down(char** stringList, int stringListLength, int x, int y, int foregroundColor, int backgroundColor, Rect* rect);
+@@ -1058,6 +1067,43 @@
+     Window* window = GNW_find(win);
+     unsigned char* buffer = window->buffer + window->width * y + x;
+ 
++#ifdef __PS3__
++    // When the text field becomes active the PS3 system keyboard opens
++    // automatically, prefilled with the field's current text. On accept the
++    // field is fully replaced with the new text (delete/edit happens inside
++    // the OSK). On cancel we fall back to the classic loop (USB kbd/mouse ok).
++    {
++        int oldWidth = text_width(dest);
++        char oskText[PS3_OSK_BUF_LEN];
++        bool accepted = ps3_osk_get_text("", dest, oskText, maxLength);
++
++        // Do not let pad events accumulated while navigating the OSK leak
++        // into the field/game (D-pads are mapped to the A/S/P shortcuts).
++        SDL_FlushEvents(SDL_JOYAXISMOTION, SDL_JOYDEVICEREMOVED);
++        kb_clear();
++
++        if (accepted) {
++            strncpy(dest, oskText, maxLength);
++            dest[maxLength] = '\0';
++
++            int lineHeight = text_height();
++            int newWidth = text_width(dest);
++            int clearWidth = oldWidth > newWidth ? oldWidth : newWidth;
++            buf_fill(buffer, clearWidth, lineHeight, window->width, backgroundColor);
++            text_to_buf(buffer, dest, newWidth, window->width, textColor);
++
++            Rect dirtyRect;
++            dirtyRect.ulx = window->rect.ulx + x;
++            dirtyRect.uly = window->rect.uly + y;
++            dirtyRect.lrx = dirtyRect.ulx + clearWidth;
++            dirtyRect.lry = dirtyRect.uly + lineHeight;
++            GNW_win_refresh(window, &dirtyRect, NULL);
++
++            return 0;
++        }
++    }
++#endif
++
+     int cursorPos = strlen(dest);
+     dest[cursorPos] = '_';
+     dest[cursorPos + 1] = '\0';
+diff -ruN u/src/plib/gnw/svga.cc cur/src/plib/gnw/svga.cc
+--- u/src/plib/gnw/svga.cc	2026-08-04 19:34:52.384496237 +0000
++++ cur/src/plib/gnw/svga.cc	2026-08-04 19:34:53.388977622 +0000
+@@ -82,13 +82,22 @@
+ 
+ bool svga_init(VideoOptions* video_options)
+ {
++#ifndef __PS3__
+     SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
++#endif
+ 
+     if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
+         return false;
+     }
+ 
++#ifdef __PS3__
++    // PSL1GHT has no OpenGL: the "opengl" hint makes the renderer lookup fail,
++    // and SDL_WINDOW_OPENGL breaks window creation. The port's own
++    // RSX-accelerated 2D renderer is used instead.
++    Uint32 windowFlags = 0;
++#else
+     Uint32 windowFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_ALLOW_HIGHDPI;
++#endif
+ 
+     if (video_options->fullscreen) {
+         windowFlags |= SDL_WINDOW_FULLSCREEN;
+diff -ruN u/src/plib/gnw/text.cc cur/src/plib/gnw/text.cc
+--- u/src/plib/gnw/text.cc	2026-08-04 19:34:52.384496237 +0000
++++ cur/src/plib/gnw/text.cc	2026-08-04 19:34:53.419648809 +0000
+@@ -3,6 +3,12 @@
+ #include <stdio.h>
+ #include <string.h>
+ 
++#ifdef __PS3__
++// .fon files are little-endian (DOS/x86 heritage); on the big-endian Cell
++// the fields must be swapped after reading.
++#include <SDL_endian.h>
++#endif
++
+ #include "platform_compat.h"
+ #include "plib/color/color.h"
+ #include "plib/db/db.h"
+@@ -153,6 +159,12 @@
+     if (db_fread(&(textFontDescriptor->height), 4, 1, stream) != 1) goto out;
+     if (db_fread(&(textFontDescriptor->spacing), 4, 1, stream) != 1) goto out;
+ 
++#ifdef __PS3__
++    textFontDescriptor->num = SDL_SwapLE32(textFontDescriptor->num);
++    textFontDescriptor->height = SDL_SwapLE32(textFontDescriptor->height);
++    textFontDescriptor->spacing = SDL_SwapLE32(textFontDescriptor->spacing);
++#endif
++
+     int glyphsPtr;
+     if (db_fread(&glyphsPtr, 4, 1, stream) != 1) goto out;
+ 
+@@ -168,6 +180,13 @@
+         goto out;
+     }
+ 
++#ifdef __PS3__
++    for (int k = 0; k < textFontDescriptor->num; k++) {
++        textFontDescriptor->info[k].width = SDL_SwapLE32(textFontDescriptor->info[k].width);
++        textFontDescriptor->info[k].offset = SDL_SwapLE32(textFontDescriptor->info[k].offset);
++    }
++#endif
++
+     dataSize = textFontDescriptor->height * ((textFontDescriptor->info[textFontDescriptor->num - 1].width + 7) >> 3) + textFontDescriptor->info[textFontDescriptor->num - 1].offset;
+     textFontDescriptor->data = (unsigned char*)mem_malloc(dataSize);
+     if (textFontDescriptor->data == NULL) {
+diff -ruN u/src/plib/gnw/winmain.cc cur/src/plib/gnw/winmain.cc
+--- u/src/plib/gnw/winmain.cc	2026-08-04 19:34:52.384496237 +0000
++++ cur/src/plib/gnw/winmain.cc	2026-08-04 19:34:53.411981012 +0000
+@@ -16,6 +16,12 @@
+ #include "platform/ios/paths.h"
+ #endif
+ 
++#ifdef __PS3__
++#include <stdio.h>
++
++#include "platform/ps3/paths.h"
++#endif
++
+ namespace fallout {
+ 
+ // 0x53A290
+@@ -58,6 +64,17 @@
+     chdir(SDL_AndroidGetExternalStoragePath());
+ #endif
+ 
++#ifdef __PS3__
++    // The process has no meaningful cwd on PS3; without switching to the data
++    // directory, relative paths (fallout.cfg, master.dat) fail with ENOENT.
++    if (chdir(PS3_GAME_DATA_PATH) != 0) {
++        printf("[fallout-ce] chdir('%s') failed - game data will not be found\n",
++            PS3_GAME_DATA_PATH);
++    } else {
++        printf("[fallout-ce] data directory: %s\n", PS3_GAME_DATA_PATH);
++    }
++#endif
++
+     SDL_ShowCursor(SDL_DISABLE);
+ 
+     GNW95_isActive = true;
