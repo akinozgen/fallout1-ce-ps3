@@ -1,0 +1,24 @@
+# --- Build output -------------------------------------------------------
+build/
+fallout1-ce/build-ps3/
+pkg/build/
+*.o
+*.elf
+*.self
+*.fake.self
+*.pkg
+
+# --- Game data — never commit -------------------------------------------
+# Supplied by the player from their own legal copy of the game.
+pkg/pkgfiles*/
+*.DAT
+*.dat
+SAVEGAME/
+
+# --- Local tooling ------------------------------------------------------
+rpcs3/
+ps3dev-image.tar
+CLAUDE.md
+
+# --- Misc ---------------------------------------------------------------
+*.log

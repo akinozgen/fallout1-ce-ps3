@@ -1,0 +1,4 @@
+# Satir sonu donusumu YOK — dosyalar bayt bayt saklanir.
+# (Windows host + Docker/PSL1GHT karisiminda autocrlf gecmiste shebang'leri
+# bozup build'i kirdi; bkz. README "CRLF tuzagi".)
+* -text
