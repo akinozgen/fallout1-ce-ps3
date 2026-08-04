@@ -7,6 +7,13 @@ This is not an emulator: the engine is cross-compiled for the Cell PPU and
 renders through an RSX-accelerated SDL2 backend. **No CFW required** — the
 package installs on any PS3 running PS3HEN. It also runs under RPCS3.
 
+## Screenshots
+
+| | |
+|---|---|
+| ![Intro movie](screenshots/01-intro-movie.png) | ![Main menu](screenshots/02-main-menu.png) |
+| ![Character and inventory](screenshots/03-character-inventory.png) | ![Gameplay](screenshots/04-gameplay.png) |
+
 ## Status
 
 | Area | State |
