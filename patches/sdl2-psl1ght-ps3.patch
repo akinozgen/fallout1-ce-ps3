@@ -1,0 +1,223 @@
+diff -ruN s/src/render/psl1ght/SDL_PSL1GHTrender.c scur/src/render/psl1ght/SDL_PSL1GHTrender.c
+--- s/src/render/psl1ght/SDL_PSL1GHTrender.c	2026-08-04 19:35:48.082487097 +0000
++++ scur/src/render/psl1ght/SDL_PSL1GHTrender.c	2026-08-04 19:35:59.206518744 +0000
+@@ -105,6 +105,11 @@
+     void *textures[3];
+     gcmContextData *context; // Context to keep track of the RSX buffer.
+     u32 ropValue;
++    /* Drawing offset (viewport + centering). As of SDL 2.0.22+ renderer->viewport
++       became an SDL_DRect and belongs to the frontend; it can neither be cast to
++       int nor mutated (the frontend resets it). The offset is kept here. */
++    int off_x;
++    int off_y;
+ } PSL1GHT_RenderData;
+ 
+ typedef struct
+@@ -387,22 +392,37 @@
+     PSL1GHT_RenderData *data = (PSL1GHT_RenderData *)renderer->driverdata;
+     SDL_Surface *surface = data->screens[0];
+ 
+-    if (!renderer->viewport.w && !renderer->viewport.h) {
++    SDL_Rect vp;
++    vp.x = (int)renderer->viewport.x;
++    vp.y = (int)renderer->viewport.y;
++    vp.w = (int)renderer->viewport.w;
++    vp.h = (int)renderer->viewport.h;
++
++    if (!vp.w && !vp.h) {
+         /* There may be no window, so update the viewport directly */
+-        renderer->viewport.w = surface->w;
+-        renderer->viewport.h = surface->h;
++        vp.w = surface->w;
++        vp.h = surface->h;
+     }
+ 
+     /* Center drawable region on screen */
++    data->off_x = vp.x;
++    data->off_y = vp.y;
+     if (renderer->window && surface->w > renderer->window->w) {
+-        renderer->viewport.x += (surface->w - renderer->window->w)/2;
++        data->off_x += (surface->w - renderer->window->w) / 2;
+     }
+     if (renderer->window && surface->h > renderer->window->h) {
+-        renderer->viewport.y += (surface->h - renderer->window->h)/2;
++        data->off_y += (surface->h - renderer->window->h) / 2;
+     }
+ 
+-    SDL_SetClipRect(data->screens[0], (const SDL_Rect *)&renderer->viewport);
+-    SDL_SetClipRect(data->screens[1], (const SDL_Rect *)&renderer->viewport);
++    {
++        SDL_Rect clip;
++        clip.x = data->off_x;
++        clip.y = data->off_y;
++        clip.w = vp.w;
++        clip.h = vp.h;
++        SDL_SetClipRect(data->screens[0], &clip);
++        SDL_SetClipRect(data->screens[1], &clip);
++    }
+     return 0;
+ }
+ 
+@@ -451,6 +471,7 @@
+                     int count)
+ {
+     SDL_Surface *surface = PSL1GHT_ActivateRenderer(renderer);
++    PSL1GHT_RenderData *data = (PSL1GHT_RenderData *)renderer->driverdata;
+     SDL_Point *temp = NULL;
+     int status;
+ 
+@@ -458,15 +479,15 @@
+         return -1;
+     }
+ 
+-    if (renderer->viewport.x || renderer->viewport.y) {
++    if (data->off_x || data->off_y) {
+         int i;
+-        int x = renderer->viewport.x;
+-        int y = renderer->viewport.y;
++        int x = data->off_x;
++        int y = data->off_y;
+ 
+         temp = SDL_stack_alloc(SDL_Point, count);
+         for (i = 0; i < count; ++i) {
+             temp[i].x = x + points[i].x;
+-            temp[i].y = y + points[i].x;
++            temp[i].y = y + points[i].y;
+         }
+         points = temp;
+     }
+@@ -496,6 +517,7 @@
+                    int count)
+ {
+     SDL_Surface *surface = PSL1GHT_ActivateRenderer(renderer);
++    PSL1GHT_RenderData *data = (PSL1GHT_RenderData *)renderer->driverdata;
+     SDL_Point *temp = NULL;
+     int status;
+ 
+@@ -503,10 +525,10 @@
+         return -1;
+     }
+ 
+-    if (renderer->viewport.x || renderer->viewport.y) {
++    if (data->off_x || data->off_y) {
+         int i;
+-        int x = renderer->viewport.x;
+-        int y = renderer->viewport.y;
++        int x = data->off_x;
++        int y = data->off_y;
+ 
+         temp = SDL_stack_alloc(SDL_Point, count);
+         for (i = 0; i < count; ++i) {
+@@ -546,6 +568,8 @@
+         return -1;
+     }
+     cmd->data.draw.count = count;
++    /* The SDL_FRect (float) -> SDL_Rect (int) conversion must be done element by
++       element; a bulk memcpy would copy float bit patterns as ints (garbage coordinates). */
+     for (int i = 0; i < count; ++i)
+     {
+         outRects[i].x = rects[i].x;
+@@ -554,8 +578,6 @@
+         outRects[i].h = rects[i].h;
+     }
+ 
+-    SDL_memcpy(outRects, rects, outLen);
+-
+     return 0;
+ }
+ 
+@@ -563,6 +585,7 @@
+ PSL1GHT_RenderFillRects(SDL_Renderer *renderer, const SDL_Rect *rects, int count)
+ {
+     SDL_Surface *surface = PSL1GHT_ActivateRenderer(renderer);
++    PSL1GHT_RenderData *data = (PSL1GHT_RenderData *)renderer->driverdata;
+     SDL_Rect *temp = NULL;
+     int status;
+ 
+@@ -570,10 +593,10 @@
+         return -1;
+     }
+ 
+-    if (renderer->viewport.x || renderer->viewport.y) {
++    if (data->off_x || data->off_y) {
+         int i;
+-        int x = renderer->viewport.x;
+-        int y = renderer->viewport.y;
++        int x = data->off_x;
++        int y = data->off_y;
+ 
+         temp = SDL_stack_alloc(SDL_Rect, count);
+         for (i = 0; i < count; ++i) {
+@@ -638,9 +661,9 @@
+         return -1;
+     }
+ 
+-    if (renderer->viewport.x || renderer->viewport.y) {
+-        dstrect->x += renderer->viewport.x;
+-        dstrect->y += renderer->viewport.y;
++    if (data->off_x || data->off_y) {
++        dstrect->x += data->off_x;
++        dstrect->y += data->off_y;
+     }
+ 
+     rsxAddressToOffset(dst->pixels, &dst_offset);
+@@ -801,6 +824,7 @@
+             }
+ 
+             case SDL_RENDERCMD_SETVIEWPORT: {
++                PSL1GHT_UpdateViewport(renderer);
+                 break;
+             }
+ 
+@@ -809,6 +833,13 @@
+             }
+ 
+             case SDL_RENDERCMD_CLEAR: {
++                /* Take the color from the value at the time the command was queued;
++                   at flush time renderer->color holds the last SetRenderDrawColor
++                   (wrong color). */
++                renderer->color.r = cmd->data.color.r;
++                renderer->color.g = cmd->data.color.g;
++                renderer->color.b = cmd->data.color.b;
++                renderer->color.a = cmd->data.color.a;
+                 PSL1GHT_RenderClear(renderer);
+                 break;
+             }
+@@ -817,6 +848,11 @@
+                 const size_t count = cmd->data.draw.count;
+                 const size_t first = cmd->data.draw.first;
+                 const SDL_Point *points = (SDL_Point *) (((Uint8 *) vertices) + first);
++                renderer->color.r = cmd->data.draw.r;
++                renderer->color.g = cmd->data.draw.g;
++                renderer->color.b = cmd->data.draw.b;
++                renderer->color.a = cmd->data.draw.a;
++                renderer->blendMode = cmd->data.draw.blend;
+                 PSL1GHT_RenderDrawPoints(renderer, points, count);
+                 break;
+             }
+@@ -825,7 +861,11 @@
+                 const size_t count = cmd->data.draw.count;
+                 const size_t first = cmd->data.draw.first;
+                 const SDL_Point *points = (SDL_Point *) (((Uint8 *) vertices) + first);
+-
++                renderer->color.r = cmd->data.draw.r;
++                renderer->color.g = cmd->data.draw.g;
++                renderer->color.b = cmd->data.draw.b;
++                renderer->color.a = cmd->data.draw.a;
++                renderer->blendMode = cmd->data.draw.blend;
+                 PSL1GHT_RenderDrawLines(renderer, points, count);
+                 break;
+             }
+@@ -834,7 +874,11 @@
+                 const size_t count = cmd->data.draw.count;
+                 const size_t first = cmd->data.draw.first;
+                 const SDL_Rect *rects = (SDL_Rect *) (((Uint8 *) vertices) + first);
+-
++                renderer->color.r = cmd->data.draw.r;
++                renderer->color.g = cmd->data.draw.g;
++                renderer->color.b = cmd->data.draw.b;
++                renderer->color.a = cmd->data.draw.a;
++                renderer->blendMode = cmd->data.draw.blend;
+                 PSL1GHT_RenderFillRects(renderer, rects, count);
+                 break;
+             }
