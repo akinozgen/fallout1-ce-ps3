@@ -1,0 +1,4 @@
+# Build context'e sadece SDL2_PSL1GHT gerekiyor
+*
+!SDL2_PSL1GHT
+SDL2_PSL1GHT/.git
