@@ -1,0 +1,213 @@
+name: Bug report
+description: Something does not work, crashes or looks wrong.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please fill in every field you can — most PS3 problems
+        depend on the console model, firmware and video settings, and cannot be
+        reproduced without them.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the problem. Photos of the TV are welcome.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Where in the game, and what you did right before it happened.
+      placeholder: |
+        1. Load the save in Junktown
+        2. Enter Gizmo's casino
+        3. Game freezes
+    validations:
+      required: true
+
+  - type: dropdown
+    id: reproducibility
+    attributes:
+      label: How often does it happen?
+      options:
+        - Every time
+        - Sometimes
+        - Happened once
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: "## Console"
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Real PS3
+        - RPCS3 emulator
+    validations:
+      required: true
+
+  - type: dropdown
+    id: model
+    attributes:
+      label: Console model
+      description: Skip if you use RPCS3.
+      options:
+        - FAT (CECHAxx–CECHQxx)
+        - Slim (CECH-20xx / 21xx / 25xx / 30xx)
+        - Super Slim (CECH-40xx / 42xx / 43xx)
+        - Not sure
+
+  - type: input
+    id: model_code
+    attributes:
+      label: Model code
+      description: Printed on the label on the back of the console. Skip if you use RPCS3.
+      placeholder: e.g. CECH-2504A
+
+  - type: dropdown
+    id: exploit
+    attributes:
+      label: HEN or CFW?
+      description: Skip if you use RPCS3.
+      options:
+        - PS3HEN
+        - CFW
+        - Not sure
+
+  - type: input
+    id: firmware
+    attributes:
+      label: Firmware / HEN / CFW version
+      description: |
+        Firmware version is under Settings → System Settings → System Information.
+        Add the HEN version, or the CFW name and version.
+      placeholder: e.g. 4.92 + PS3HEN 3.4.0 / 4.92 Evilnat CEX
+    validations:
+      required: true
+
+  - type: input
+    id: rpcs3_version
+    attributes:
+      label: RPCS3 version
+      description: Only if you use RPCS3 (Help → About).
+      placeholder: e.g. 0.0.43-20376
+
+  - type: markdown
+    attributes:
+      value: "## Video"
+
+  - type: dropdown
+    id: resolution
+    attributes:
+      label: Video output resolution
+      description: Settings → Display Settings → Video Output Settings.
+      options:
+        - 1080p
+        - 1080i
+        - 720p
+        - 576p / 480p
+        - 576i / 480i
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: tv_aspect
+    attributes:
+      label: TV screen size set on the PS3
+      description: Chosen in Video Output Settings (only asked for SD resolutions).
+      options:
+        - "16:9"
+        - "4:3"
+        - Not asked / not sure
+
+  - type: dropdown
+    id: connection
+    attributes:
+      label: Video connection
+      options:
+        - HDMI
+        - Component
+        - Composite (AV)
+        - Not sure
+
+  - type: markdown
+    attributes:
+      value: "## Game"
+
+  - type: dropdown
+    id: release
+    attributes:
+      label: Port version
+      options:
+        - v0.1.0
+        - Built from source (write the commit below)
+    validations:
+      required: true
+
+  - type: input
+    id: commit
+    attributes:
+      label: Commit (only if built from source)
+      placeholder: e.g. a929031
+
+  - type: dropdown
+    id: data_source
+    attributes:
+      label: Where are the game files from?
+      options:
+        - GOG
+        - Steam
+        - Epic
+        - Original CD
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: hires_ini
+    attributes:
+      label: Is there an f1_res.ini file in the game folder?
+      description: Look in /dev_hdd0/game/FALL1CE00/USRDIR/.
+      options:
+        - "Yes"
+        - "No"
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: f1_res.ini and fallout.cfg contents
+      description: Paste them if present. This field is shown as plain text.
+      render: ini
+
+  - type: dropdown
+    id: input
+    attributes:
+      label: Controller / input
+      multiple: true
+      options:
+        - DualShock 3
+        - DualShock 4
+        - USB keyboard
+        - USB mouse
+        - Other
+
+  - type: textarea
+    id: attachments
+    attributes:
+      label: Save file and logs
+      description: |
+        For crashes, a save from just before the problem helps most: zip the slot folder
+        (e.g. DATA/SAVEGAME/SLOT01) and drag it here.
+        On RPCS3, also attach TTY.log from the RPCS3 log folder.
